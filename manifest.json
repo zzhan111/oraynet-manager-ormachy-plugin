@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "local.pgybox",
+  "name": "PgyBox Gateway",
+  "version": "0.1.0",
+  "author": "beta",
+  "license": "Apache-2.0",
+  "description": "蒲公英 (PgyBox) 远程网关：可达状态与 WAN 实时上下行速率，显示在 Omarchy 顶栏。",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "PgyBox Gateway",
+    "description": "蒲公英远程网关可达状态与 WAN 实时速率。左键明细面板，中键立即刷新，右键打开蒲公英云管理。",
+    "category": "Network",
+    "aliases": [
+      "pgybox",
+      "gateway"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "display": "rate"
+    },
+    "schema": [
+      {
+        "key": "display",
+        "type": "enum",
+        "label": "显示内容",
+        "options": [
+          "rate",
+          "down",
+          "up"
+        ],
+        "defaultValue": "rate",
+        "description": "rate = ↑↓ 双速率；down = 仅下行；up = 仅上行。"
+      }
+    ]
+  }
+}

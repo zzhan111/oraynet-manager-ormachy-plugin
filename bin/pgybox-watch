@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+# pgybox-watch - 只观察已打开 PgyBox 页面的下一次 WAN 流量响应。
+# 不取 cookie，不读取或转发认证头，不导航，不触发页面请求。
+import base64
+import json
+import math
+import os
+import select
+import socket
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CDP_PORTS = (19825, 9222)
+FLOW_PATH = "/api/flowrate_wan_get"
+WATCH_TIMEOUT = 25.0
+
+
+class WatchError(RuntimeError):
+    pass
+
+
+def cdp_websocket_url() -> tuple[str | None, str]:
+    """Find an already-open PgyBox page; never opens or navigates a page."""
+    saw_browser = False
+    for port in CDP_PORTS:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as response:
+                tabs = json.load(response)
+            saw_browser = True
+            for tab in tabs:
+                url = tab.get("url", "")
+                if tab.get("type") == "page" and "pgybox.com" in url:
+                    ws_url = tab.get("webSocketDebuggerUrl")
+                    if ws_url:
+                        return ws_url, ""
+        except Exception:
+            continue
+    return None, "no-pgybox-page" if saw_browser else "no-browser"
+
+
+def _masked_frame(payload: bytes, opcode: int = 1) -> bytes:
+    mask = b"pgy!"
+    size = len(payload)
+    if size < 126:
+        header = bytes((0x80 | opcode, 0x80 | size))
+    elif size < 65536:
+        header = bytes((0x80 | opcode, 0x80 | 126)) + size.to_bytes(2, "big")
+    else:
+        header = bytes((0x80 | opcode, 0x80 | 127)) + size.to_bytes(8, "big")
+    return header + mask + bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+
+
+class CDP:
+    def __init__(self, ws_url: str):
+        parsed = urllib.parse.urlsplit(ws_url)
+        if parsed.scheme != "ws" or not parsed.hostname:
+            raise WatchError("cdp-error")
+        self.sock = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=5)
+        self.sock.settimeout(5)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((
+            f"GET {path} HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port or 80}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).encode())
+        buffer = bytearray()
+        while b"\r\n\r\n" not in buffer:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise WatchError("cdp-error")
+            buffer += chunk
+        head, rest = bytes(buffer).split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise WatchError("cdp-error")
+        self.buffer = bytearray(rest)
+        self.next_id = 1
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _read(self, size: int, deadline: float) -> None:
+        while len(self.buffer) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([self.sock], [], [], remaining)
+            if not ready:
+                raise TimeoutError
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise WatchError("cdp-error")
+            self.buffer += chunk
+
+    def _frame(self, deadline: float) -> tuple[int, bytes]:
+        self._read(2, deadline)
+        first, second = self.buffer[0], self.buffer[1]
+        del self.buffer[:2]
+        opcode = first & 0x0F
+        length = second & 0x7F
+        if length == 126:
+            self._read(2, deadline)
+            length = int.from_bytes(self.buffer[:2], "big")
+            del self.buffer[:2]
+        elif length == 127:
+            self._read(8, deadline)
+            length = int.from_bytes(self.buffer[:8], "big")
+            del self.buffer[:8]
+        masked = bool(second & 0x80)
+        mask = b""
+        if masked:
+            self._read(4, deadline)
+            mask = bytes(self.buffer[:4])
+            del self.buffer[:4]
+        self._read(length, deadline)
+        payload = bytes(self.buffer[:length])
+        del self.buffer[:length]
+        if masked:
+            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        return opcode, payload
+
+    def _send(self, method: str, params: dict) -> int:
+        command_id = self.next_id
+        self.next_id += 1
+        payload = json.dumps({"id": command_id, "method": method, "params": params}).encode()
+        self.sock.sendall(_masked_frame(payload))
+        return command_id
+
+    def call(self, method: str, params: dict, deadline: float) -> dict:
+        command_id = self._send(method, params)
+        while True:
+            opcode, payload = self._frame(deadline)
+            if opcode == 0x9:  # ping
+                self.sock.sendall(_masked_frame(payload, opcode=0xA))
+                continue
+            if opcode == 0x8:
+                raise WatchError("cdp-error")
+            if opcode != 0x1:
+                continue
+            try:
+                message = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if message.get("id") != command_id:
+                continue
+            if "error" in message:
+                raise WatchError("cdp-error")
+            return message.get("result", {})
+
+    def next_message(self, deadline: float) -> dict:
+        while True:
+            opcode, payload = self._frame(deadline)
+            if opcode == 0x9:
+                self.sock.sendall(_masked_frame(payload, opcode=0xA))
+                continue
+            if opcode == 0x8:
+                raise WatchError("cdp-error")
+            if opcode != 0x1:
+                continue
+            try:
+                message = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if "method" in message:
+                return message
+
+
+def parse_flow_body(body: str) -> tuple[int | float, int | float]:
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        raise WatchError("invalid-json")
+    if not isinstance(data, dict) or data.get("code") != 0:
+        raise WatchError("api-code-not-zero")
+    values = data.get("wan_up"), data.get("wan_down")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        raise WatchError("invalid-wan-rate")
+    if any(not math.isfinite(float(value)) or value < 0 for value in values):
+        raise WatchError("invalid-wan-rate")
+    return values
+
+
+def observe_flow(ws_url: str) -> dict:
+    cdp = CDP(ws_url)
+    deadline = time.monotonic() + WATCH_TIMEOUT
+    request_ids: set[str] = set()
+    try:
+        cdp.call("Network.enable", {}, deadline)
+        while True:
+            message = cdp.next_message(deadline)
+            params = message.get("params", {})
+            if message.get("method") == "Network.requestWillBeSent":
+                request = params.get("request", {})
+                request_url = request.get("url", "")
+                path = urllib.parse.urlsplit(request_url).path
+                if request.get("method") == "GET" and path == FLOW_PATH:
+                    request_ids.add(str(params.get("requestId", "")))
+                continue
+            if message.get("method") != "Network.responseReceived":
+                continue
+            request_id = str(params.get("requestId", ""))
+            response = params.get("response", {})
+            path = urllib.parse.urlsplit(response.get("url", "")).path
+            if request_id not in request_ids or path != FLOW_PATH:
+                continue
+            if response.get("status") != 200:
+                raise WatchError(f"http-{response.get('status', 'error')}")
+            result = cdp.call("Network.getResponseBody", {"requestId": request_id}, deadline)
+            body = result.get("body", "")
+            if result.get("base64Encoded"):
+                try:
+                    body = base64.b64decode(body).decode()
+                except (ValueError, UnicodeDecodeError):
+                    raise WatchError("invalid-body")
+            up, down = parse_flow_body(body)
+            return {"ok": True, "reachable": True, "up": up, "down": down, "ts": time.time()}
+    finally:
+        cdp.close()
+
+
+def snapshot() -> dict:
+    ws_url, error = cdp_websocket_url()
+    if not ws_url:
+        return {"error": error}
+    try:
+        return observe_flow(ws_url)
+    except TimeoutError:
+        return {"error": "timeout"}
+    except WatchError as error:
+        return {"error": str(error)}
+    except Exception:
+        return {"error": "cdp-error"}
+
+
+def selfcheck() -> None:
+    assert parse_flow_body('{"code":0,"wan_up":0,"wan_down":0}') == (0, 0)
+    assert parse_flow_body('{"code":0,"wan_up":1.5,"wan_down":2}') == (1.5, 2)
+    for body in ('{"code":1}', '{"code":0}', '{"code":0,"wan_up":"0","wan_down":0}'):
+        try:
+            parse_flow_body(body)
+        except WatchError:
+            pass
+        else:
+            raise AssertionError(body)
+    assert urllib.parse.urlsplit("https://www.pgybox.com/api/flowrate_wan_get?x=1").path == FLOW_PATH
+    print("pgybox-watch selfcheck: OK")
+
+
+def main() -> int:
+    if "--selfcheck" in sys.argv:
+        selfcheck()
+        return 0
+    result = snapshot()
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
