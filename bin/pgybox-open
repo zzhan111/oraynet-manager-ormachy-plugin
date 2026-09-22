@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Open or reuse PgyBox and claim its tab for the local widget."""
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+import uuid
+from pathlib import Path
+from urllib.parse import urlsplit
+
+SESSION_ID = "omarchy-local.pgybox"
+TARGET_URL = "https://www.pgybox.com/en/deviceList"
+TARGET_HOST = urlsplit(TARGET_URL).hostname
+DAEMON_JSON = Path.home() / ".bb-browser" / "daemon.json"
+CLAIM_FILE = Path.home() / ".cache" / "local.pgybox-tab"
+
+
+def full_tab_id(entry: dict) -> str | None:
+    """Return the daemon's full tab identity, never the display shorthand."""
+    value = entry.get("tabId") or entry.get("tab_id") or entry.get("id")
+    return str(value) if value else None
+
+
+def cli(*args: str) -> dict:
+    env = os.environ.copy()
+    env.update(BB_SESSION_ID=SESSION_ID, BB_SESSION_SCOPE="full")
+    result = subprocess.run(
+        ["ma-browser", *args, "--json"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError("ma-browser failed")
+    try:
+        return json.loads(result.stdout)
+    except (TypeError, ValueError):
+        raise RuntimeError("ma-browser returned invalid data")
+
+
+def claim(tab_id: str) -> None:
+    info = json.loads(DAEMON_JSON.read_text())
+    body = json.dumps({
+        "id": uuid.uuid4().hex,
+        "action": "tab_claim",
+        "tabId": tab_id,
+        "leaseMode": "shared",
+        "intent": "local.pgybox WAN monitoring",
+    }).encode()
+    request = urllib.request.Request(
+        f"http://{info['host']}:{info['port']}/command",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {info['token']}",
+            "Content-Type": "application/json",
+            "X-BB-Session": SESSION_ID,
+            "X-BB-Session-Scope": "full",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        result = json.load(response)
+    if not result.get("success"):
+        raise RuntimeError("tab_claim failed")
+    CLAIM_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLAIM_FILE.write_text(json.dumps({"tabId": tab_id}, separators=(",", ":")) + "\n")
+
+
+def main() -> int:
+    if "--selfcheck" in sys.argv:
+        fixture = Path(__file__).resolve().parent.parent / "fixtures" / "pgybox-watch" / "claim-tabs.json"
+        data = json.loads(fixture.read_text())
+        assert full_tab_id({"tab": "short-display-id", "tabId": data["claimedTabId"]}) == data["claimedTabId"]
+        assert full_tab_id({"tab": "short-display-id"}) is None
+        print("pgybox-open selfcheck: OK")
+        return 0
+    tabs = cli("tab").get("data", {}).get("tabs", [])
+    tab_id = next((full_tab_id(t) for t in tabs
+                   if urlsplit(t.get("url", "")).hostname == TARGET_HOST), None)
+    if not tab_id:
+        opened = cli("open", TARGET_URL)
+        data = opened.get("data", {})
+        tab_id = full_tab_id(data) or full_tab_id(data.get("tab", {}) if isinstance(data.get("tab"), dict) else {})
+    if not tab_id:
+        raise RuntimeError("ma-browser returned no PgyBox tab")
+    claim(tab_id)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print("pgybox-open: unable to open or claim the PgyBox tab", file=sys.stderr)
+        raise SystemExit(1)

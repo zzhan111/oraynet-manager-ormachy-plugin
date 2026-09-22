@@ -16,8 +16,13 @@ Panel {
     var v = String(setting("display", "rate"))
     return ["rate", "up", "down"].indexOf(v) >= 0 ? v : "rate"
   }
-  property var lastGoodSnap: null
-  property string recentError: ""
+  // Section-ready state: current connectivity is independent of retained data.
+  property var wanState: ({
+    data: null, lastSuccessTs: 0, status: "no-page", error: "no-page",
+    reachable: false
+  })
+  property var devicesState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
+  property var trafficState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property bool ratesCollapsed: false
   property double nowSec: Date.now() / 1000
   property bool demoMode: false
@@ -26,20 +31,30 @@ Panel {
     name: "PgyBox Gateway", sn: "—", wanIp: "—", lanIp: "—",
     joined: true, up: 0, down: 0, ts: Date.now() / 1000
   })
-  readonly property var snap: demoMode ? demoSnap : lastGoodSnap
+  readonly property var snap: demoMode ? demoSnap : wanState.data
   readonly property int watcherRetrySec: 1
   readonly property int freshWindowSec: 10
-  readonly property bool hasSuccess: !!lastGoodSnap || demoMode
-  readonly property bool reachable: hasSuccess
+  readonly property bool hasSuccess: !!wanState.data || demoMode
+  readonly property bool reachable: demoMode || wanState.reachable
   readonly property var rateUp: snap ? snap.up : 0
   readonly property var rateDown: snap ? snap.down : 0
-  readonly property double snapTs: snap ? Number(snap.ts || 0) : 0
+  readonly property double snapTs: demoMode ? Number(snap.ts || 0) : Number(wanState.lastSuccessTs || 0)
   readonly property bool hasRate: !!snap && snap.up !== undefined && snap.down !== undefined
-  readonly property bool fresh: !!snap && hasRate && hasSuccess && !recentError
+  readonly property bool fresh: !!snap && hasRate && reachable
     && (nowSec - snapTs < freshWindowSec)
+  readonly property bool devicesFresh: !!devicesState.data && devicesState.status === "ok" && (nowSec - Number(devicesState.lastSuccessTs || 0) < freshWindowSec)
+  readonly property var trafficData: trafficState.data || ({})
+  readonly property bool trafficFresh: !!trafficState.data && trafficState.status === "ok" && (nowSec - Number(trafficState.lastSuccessTs || 0) < freshWindowSec)
+  readonly property bool available: ["no-claimed-tab", "no-pgybox-page", "no-browser", "unauthorized"].indexOf(wanState.status) < 0
+    && (fresh || devicesFresh || trafficFresh)
   readonly property string statusText: {
     if (demoMode) return "正常"
-    if (recentError !== "" || !hasSuccess) return "状态暂不可用"
+    if (wanState.status === "no-claimed-tab" || wanState.status === "no-pgybox-page") return "页面未打开"
+    if (wanState.status === "no-browser") return "浏览器未运行"
+    if (!reachable && wanState.status === "unauthorized") return "登录已失效"
+    if (!reachable && wanState.status === "timeout") return "页面无新数据"
+    if (!reachable) return "状态暂不可用"
+    if (!snap) return "页面已连接"
     return fresh ? "正常" : "数据已过期"
   }
   readonly property color fg: bar ? bar.foreground : Color.foreground
@@ -67,6 +82,13 @@ Panel {
     if (n < 1000 * 1000 * 1000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "MB/s"
     return (n / 1000000000).toFixed(1).replace(/\.0$/, "") + "GB/s"
   }
+  function fmtBytes(value) {
+    var n = Number(value)
+    if (!isFinite(n) || n < 0) return "—"
+    if (n < 1000 * 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "KB"
+    if (n < 1000 * 1000 * 1000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "MB"
+    return (n / 1000000000).toFixed(1).replace(/\.0$/, "") + "GB"
+  }
   function fmtAgo() {
     if (!snap || !snapTs) return "—"
     var s = Math.max(0, Math.floor(nowSec - snapTs))
@@ -78,24 +100,70 @@ Panel {
     watcherProc.running = true
   }
   function openCloud() {
-    Quickshell.execDetached(["ma-browser", "open", "https://www.pgybox.com/zh/introduction?model=R300A-3151G"])
+    var opener = Qt.resolvedUrl("bin/pgybox-open").toString().replace(/^file:\/\//, "")
+    Quickshell.execDetached([opener])
     root.close()
+  }
+  function markPageReachable() {
+    if (!root.wanState.reachable) root.wanState = ({
+      data: root.wanState.data, lastSuccessTs: root.wanState.lastSuccessTs,
+      status: "page-ok", error: "", reachable: true
+    })
   }
   function parseState(text) {
     try {
       var parsed = JSON.parse(String(text || ""))
+      var sectionError = function(value) {
+        var allowed = ["timeout", "unauthorized", "invalid-json", "devices-api-error", "devices-invalid", "traffic-invalid", "body-unavailable", "http-error", "cdp-error"]
+        return allowed.indexOf(String(value || "")) >= 0 ? String(value) : "error"
+      }
+      if (parsed && parsed.section === "devices") {
+        root.devicesState = parsed.ok === true
+          ? ({data: parsed.data, lastSuccessTs: Number(parsed.ts || Date.now() / 1000), status: "ok", error: "", reachable: true})
+          : ({data: root.devicesState.data, lastSuccessTs: root.devicesState.lastSuccessTs, status: sectionError(parsed.status), error: sectionError(parsed.error || parsed.status), reachable: false})
+        if (parsed.ok === true) root.markPageReachable()
+        return
+      }
+      if (parsed && parsed.section === "traffic") {
+        root.trafficState = parsed.ok === true
+          ? ({data: Object.assign({}, root.trafficState.data || {}, parsed.data || {}), lastSuccessTs: Number(parsed.ts || Date.now() / 1000), status: "ok", error: "", reachable: true})
+          : ({data: root.trafficState.data, lastSuccessTs: root.trafficState.lastSuccessTs, status: sectionError(parsed.status), error: sectionError(parsed.error || parsed.status), reachable: false})
+        if (parsed.ok === true) root.markPageReachable()
+        return
+      }
       if (parsed && parsed.ok === true && parsed.reachable === true
           && parsed.up !== undefined && parsed.down !== undefined) {
-        root.lastGoodSnap = parsed
-        root.recentError = ""
+        var normalized = {
+          ok: true, reachable: true, status: "ok",
+          up: Number(parsed.up), down: Number(parsed.down),
+          ts: Number(parsed.ts || Date.now() / 1000)
+        }
+        root.wanState = ({
+          data: normalized, lastSuccessTs: normalized.ts,
+          status: "ok", error: "", reachable: true
+        })
       } else if (parsed && parsed.error) {
-        root.recentError = String(parsed.error)
+        var allowed = ["no-claimed-tab", "no-pgybox-page", "no-page", "no-browser", "timeout", "unauthorized", "invalid-json",
+                       "api-code-not-zero", "invalid-wan-rate", "body-unavailable",
+                       "invalid-body", "http-error", "cdp-error"]
+        var status = allowed.indexOf(String(parsed.status || parsed.error)) >= 0
+          ? String(parsed.status || parsed.error) : "cdp-error"
+        root.wanState = ({
+          data: root.wanState.data, lastSuccessTs: root.wanState.lastSuccessTs,
+          status: status, error: status, reachable: false
+        })
       } else {
-        root.recentError = "invalid-response"
+        root.wanState = ({
+          data: root.wanState.data, lastSuccessTs: root.wanState.lastSuccessTs,
+          status: "invalid-json", error: "invalid-json", reachable: false
+        })
       }
     } catch (e) {
-      root.recentError = "invalid-json"
-      console.warn("pgybox", "bad state line", e)
+      root.wanState = ({
+        data: root.wanState.data, lastSuccessTs: root.wanState.lastSuccessTs,
+        status: "invalid-json", error: "invalid-json", reachable: false
+      })
+      console.warn("pgybox", "invalid watcher state")
     }
   }
 
@@ -107,7 +175,7 @@ Panel {
     stdout: SplitParser { onRead: function(data) { root.parseState(data) } }
     stderr: SplitParser {
       onRead: function(data) {
-        if (String(data).trim() !== "") console.warn("pgybox", String(data).trim())
+        if (String(data).trim() !== "") console.warn("pgybox", "watcher reported an error")
       }
     }
     onExited: restartTimer.start()
@@ -153,11 +221,11 @@ Panel {
             anchors.fill: oraySource
             source: oraySource
             colorization: 1.0
-            colorizationColor: root.fresh ? root.fg : root.dim
+            colorizationColor: root.available ? "#ffffff" : root.dim
           }
         }
       }
-      foreground: root.fresh ? root.fg : root.dim
+      foreground: root.available ? "#ffffff" : root.dim
       onPressed: function(buttonCode) { root.barPressed(buttonCode) }
     }
     Item {
@@ -186,7 +254,7 @@ Panel {
     cursorShape: Qt.PointingHandCursor
     onClicked: function(mouse) {
       if (mouse.button === Qt.LeftButton) {
-        if (root.ratesCollapsed) root.barPressed(mouse.button)
+        if (root.ratesCollapsed) root.ratesCollapsed = false
         else if (root.barLabel !== "" && mouse.x >= rateItem.x
                  && mouse.x < rateItem.x + rateItem.width) root.ratesCollapsed = true
         else root.barPressed(mouse.button)
@@ -198,6 +266,10 @@ Panel {
     onExited: if (root.bar) root.bar.hideTooltip(row)
   }
   function barPressed(buttonCode) {
+    if (buttonCode === Qt.LeftButton && root.ratesCollapsed) {
+      root.ratesCollapsed = false
+      return
+    }
     if (buttonCode === Qt.RightButton) root.openCloud()
     else if (buttonCode === Qt.MiddleButton) root.refresh()
     else root.toggle()
@@ -284,6 +356,40 @@ Panel {
             alert: root.statusText === "状态暂不可用"
           }
         }
+        Rectangle { width: parent.width; height: 1; color: root.faint }
+        Column {
+          width: parent.width
+          spacing: Style.space(3)
+          Text { text: "设备"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          DetailRow { label: "在线"; value: root.devicesState.data ? String(root.devicesState.data.online) : "—" }
+          DetailRow { label: "活跃"; value: root.devicesState.data ? String(root.devicesState.data.active) : "—" }
+          Repeater {
+            model: root.devicesState.data ? root.devicesState.data.top : []
+            delegate: DetailRow { label: modelData.name; value: "↑" + root.fmtRate(modelData.up) + " ↓" + root.fmtRate(modelData.down) }
+          }
+          Text { visible: !root.devicesState.data; text: root.devicesState.status === "no-data" ? "暂无设备数据" : "设备数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          Text { visible: !!root.devicesState.data && !root.devicesFresh; text: "设备数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+        }
+        Rectangle { width: parent.width; height: 1; color: root.faint }
+        Column {
+          width: parent.width
+          spacing: Style.space(3)
+          Text { text: "流量用量"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          DetailRow { label: "近 7 天"; value: root.trafficData.days7 !== undefined ? root.fmtBytes(root.trafficData.days7) : "—" }
+          DetailRow { label: "近 30 天"; value: root.trafficData.days30 !== undefined ? root.fmtBytes(root.trafficData.days30) : "—" }
+          DetailRow { label: "本月已用"; value: root.trafficData.used !== undefined && root.trafficData.used !== null ? root.fmtBytes(root.trafficData.used) : "—" }
+          DetailRow { label: "月度限额"; value: root.trafficData.limit !== undefined && root.trafficData.limit !== null ? root.fmtBytes(root.trafficData.limit) : "未设置"; alert: !!root.trafficData.warning }
+          Rectangle {
+            visible: root.trafficData.limit > 0
+            width: parent.width; height: Style.space(2); color: root.faint
+            Rectangle {
+              width: parent.width * Math.min(1, Math.max(0, Number(root.trafficData.used || 0) / Number(root.trafficData.limit || 1)))
+              height: parent.height; color: root.trafficData.warning ? root.urgent : root.fg
+            }
+          }
+          Text { visible: !root.trafficState.data; text: root.trafficState.status === "no-data" ? "暂无流量数据" : "流量数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          Text { visible: !!root.trafficState.data && !root.trafficFresh; text: "流量数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+        }
       }
     }
   }
@@ -321,6 +427,6 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
     function demo(): string { root.demoMode = !root.demoMode; if (root.demoMode && !root.opened) root.open(); return root.demoMode ? "demo" : "live" }
-    function state(): string { return JSON.stringify({snap: root.snap, display: root.display, demo: root.demoMode}) }
+    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, display: root.display, demo: root.demoMode}) }
   }
 }

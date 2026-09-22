@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pgybox-watch - 只观察已打开 PgyBox 页面的下一次 WAN 流量响应。
+# pgybox-watch - 只观察已打开 PgyBox 页面自然产生的只读响应。
 # 不取 cookie，不读取或转发认证头，不导航，不触发页面请求。
 import base64
 import json
@@ -11,10 +11,23 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
+from pathlib import Path
 
 CDP_PORTS = (19825, 9222)
+PGYBOX_HOST = "www.pgybox.com"
+PGYBOX_API_HOST = "pgyboxapi.sdwan.oray.com"
+CLAIM_FILE = Path.home() / ".cache" / "local.pgybox-tab"
 FLOW_PATH = "/api/flowrate_wan_get"
+DEVICE_PATH = "/api/lan_device_get"
+IP_FLOW_PATH = "/api/flowrate_ip_get"
+FLOW_HISTORY_PATH = "/devices/-/cpe/flows"
+WARN_PATH = "/api/flow_warn_get"
 WATCH_TIMEOUT = 25.0
+SETTLE_TIMEOUT = 2.0
+SAFE_STATUSES = {"no-claimed-tab", "no-pgybox-page", "no-browser", "timeout", "unauthorized",
+                 "invalid-json", "api-code-not-zero", "invalid-wan-rate", "body-unavailable",
+                 "invalid-body", "http-error", "cdp-error"}
 
 
 class WatchError(RuntimeError):
@@ -24,20 +37,198 @@ class WatchError(RuntimeError):
 def cdp_websocket_url() -> tuple[str | None, str]:
     """Find an already-open PgyBox page; never opens or navigates a page."""
     saw_browser = False
+    try:
+        claimed_record = json.loads(CLAIM_FILE.read_text())
+        claimed_tab = str(claimed_record.get("tabId", ""))
+    except (OSError, UnicodeDecodeError):
+        claimed_tab = ""
+    if not claimed_tab:
+        return None, "no-claimed-tab"
     for port in CDP_PORTS:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as response:
                 tabs = json.load(response)
             saw_browser = True
-            for tab in tabs:
-                url = tab.get("url", "")
-                if tab.get("type") == "page" and "pgybox.com" in url:
-                    ws_url = tab.get("webSocketDebuggerUrl")
-                    if ws_url:
-                        return ws_url, ""
+            claimed = next((tab for tab in tabs
+                            if tab.get("type") == "page" and str(tab.get("id", "")) == claimed_tab
+                            and urllib.parse.urlsplit(tab.get("url", "")).hostname == PGYBOX_HOST), None)
+            if claimed and "/passport/login" in urllib.parse.urlsplit(claimed.get("url", "")).path:
+                return None, "unauthorized"
+            target = claimed_cdp_target(claimed_tab, tabs)
+            if target:
+                return target, ""
         except Exception:
             continue
     return None, "no-pgybox-page" if saw_browser else "no-browser"
+
+
+def claimed_cdp_target(tab_id: str, tabs: list[dict]) -> str | None:
+    for tab in tabs:
+        url = tab.get("url", "")
+        if (tab.get("type") == "page" and str(tab.get("id", "")) == tab_id
+                and urllib.parse.urlsplit(url).hostname == PGYBOX_HOST):
+            ws_url = tab.get("webSocketDebuggerUrl")
+            if ws_url:
+                return ws_url
+    return None
+
+
+def is_flow_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    return (parsed.scheme == "https" and parsed.hostname == PGYBOX_API_HOST
+            and parsed.port in (None, 443) and parsed.path == FLOW_PATH)
+
+
+def is_api_url(url: str, path: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname == PGYBOX_API_HOST and parsed.port in (None, 443) and parsed.path == path
+
+
+def is_history_url(url: str) -> int | None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != PGYBOX_API_HOST or parsed.port not in (None, 443) or parsed.path != FLOW_HISTORY_PATH:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    if query.get("sim") != ["1"] or query.get("limit") not in (["7"], ["30"]):
+        return None
+    return int(query["limit"][0])
+
+
+def finite_nonnegative(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def safe_name(entry: dict, index: int) -> str:
+    for key in ("alias", "hostname"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:48]
+    return f"未知设备 {index + 1}"
+
+
+def parse_devices(body: str, lan_body: str | None = None) -> dict:
+    payload = json.loads(body)
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        raise WatchError("devices-api-error")
+    entries = []
+    seen = set()
+    for key in ("eth_data", "guest_wifi_data", "wifi5g_data", "wifi_data"):
+        values = payload.get(key, [])
+        if not isinstance(values, list):
+            raise WatchError("devices-invalid")
+        entries.extend(v for v in values if isinstance(v, dict))
+    rates = {}
+    if lan_body is not None:
+        lan = json.loads(lan_body)
+        if not isinstance(lan, dict) or lan.get("code") != 0 or not isinstance(lan.get("lan_data", []), list):
+            raise WatchError("devices-invalid")
+        for row in lan["lan_data"]:
+            if not isinstance(row, dict) or not isinstance(row.get("ip"), str):
+                continue
+            up, down = finite_nonnegative(row.get("up")), finite_nonnegative(row.get("down"))
+            if up is None or down is None:
+                raise WatchError("devices-invalid")
+            rates[row["ip"]] = (up, down)
+    devices = []
+    for index, entry in enumerate(entries):
+        identity = entry.get("mac") or entry.get("ip") or (entry.get("hostname"), entry.get("alias"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        up, down = rates.get(entry.get("ip"), (0.0, 0.0))
+        devices.append({"name": safe_name(entry, index), "up": up, "down": down})
+    ranked = sorted(devices, key=lambda d: (-(d["up"] + d["down"]), d["name"].casefold(), d["name"]))
+    return {"online": len(devices), "active": sum(1 for d in devices if d["up"] + d["down"] > 0), "top": ranked[:3]}
+
+
+def parse_enabled(value) -> bool:
+    if value is True or value == 1 and type(value) is int or value == "1":
+        return True
+    if value is False or value == 0 and type(value) is int or value == "0":
+        return False
+    raise WatchError("traffic-invalid")
+
+
+def parse_traffic(body7: str | None, body30: str | None, warning_body: str | None) -> dict:
+    def total(body):
+        payload = json.loads(body)
+        rows = payload.get("list") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise WatchError("traffic-invalid")
+        values = [finite_nonnegative(row.get("flow")) for row in rows if isinstance(row, dict)]
+        if any(v is None for v in values):
+            raise WatchError("traffic-invalid")
+        return sum(values)
+    result = {}
+    if body7 is not None:
+        result["days7"] = total(body7)
+    if body30 is not None:
+        result["days30"] = total(body30)
+    if warning_body:
+        payload = json.loads(warning_body)
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if payload.get("code") != 0 or not isinstance(rows, list):
+            raise WatchError("traffic-invalid")
+        row = rows[0] if rows else {}
+        result["used"] = finite_nonnegative(row.get("month_current_use"))
+        if result["used"] is None and row.get("month_current_use") is not None:
+            raise WatchError("traffic-invalid")
+        limit = finite_nonnegative(row.get("limit_warning"))
+        if limit is None and row.get("limit_warning") is not None:
+            raise WatchError("traffic-invalid")
+        result["limit"] = limit if limit and limit > 0 else None
+        enabled = parse_enabled(row["enabled"]) if "enabled" in row else False
+        result["warning"] = enabled and result["limit"] is not None and result["used"] is not None and result["used"] >= result["limit"]
+    return result
+
+
+def section_transition(previous: dict, result: dict) -> dict:
+    """Apply one sanitized watcher result without discarding the last good data."""
+    if result.get("ok") is True and result.get("reachable") is True:
+        return {"data": {"up": result["up"], "down": result["down"], "ts": result["ts"]},
+                "lastSuccessTs": result["ts"], "status": "ok", "error": "", "reachable": True}
+    status = result.get("status") if result.get("status") in SAFE_STATUSES else "cdp-error"
+    return {"data": previous.get("data"), "lastSuccessTs": previous.get("lastSuccessTs", 0),
+            "status": status, "error": status, "reachable": False}
+
+
+def section_name(kind: str) -> str:
+    return "wan" if kind == "wan" else "devices" if kind in ("devices", "ip-flow") else "traffic"
+
+
+def replay_section(kind: str, body: str, bodies: dict[str, str], sections: list[dict]) -> bool:
+    """Process one completed body; shared by live collection and offline event replay."""
+    bodies[kind] = body
+    now = time.time()
+    try:
+        if kind == "wan":
+            up, down = parse_flow_body(body)
+            sections.append({"section": "wan", "ok": True, "reachable": True, "status": "ok", "up": up, "down": down, "ts": now})
+            return True
+        if kind in ("devices", "ip-flow") and "devices" in bodies and "ip-flow" in bodies:
+            sections.append({"section": "devices", "ok": True, "status": "ok", "data": parse_devices(bodies["devices"], bodies["ip-flow"]), "ts": now})
+            return True
+        if kind == "history-7":
+            data = parse_traffic(body, None, None)
+        elif kind == "history-30":
+            data = parse_traffic(None, body, None)
+        elif kind == "warn":
+            data = parse_traffic(None, None, body)
+        else:
+            return False
+        sections.append({"section": "traffic", "ok": True, "status": "ok", "data": data, "ts": now})
+        return True
+    except (ValueError, TypeError, WatchError) as error:
+        status = str(error) if str(error) in SAFE_STATUSES or str(error) in {"devices-api-error", "devices-invalid", "traffic-invalid"} else "invalid-json"
+        sections.append({"section": section_name(kind), "ok": False, "status": status, "error": status, "ts": now})
+        return True
+    return False
 
 
 def _masked_frame(payload: bytes, opcode: int = 1) -> bytes:
@@ -79,6 +270,7 @@ class CDP:
             raise WatchError("cdp-error")
         self.buffer = bytearray(rest)
         self.next_id = 1
+        self.pending = deque()
 
     def close(self) -> None:
         try:
@@ -136,6 +328,22 @@ class CDP:
     def call(self, method: str, params: dict, deadline: float) -> dict:
         command_id = self._send(method, params)
         while True:
+            for message in tuple(self.pending):
+                if message.get("id") == command_id:
+                    self.pending.remove(message)
+                    if "error" in message:
+                        raise WatchError("cdp-error")
+                    return message.get("result", {})
+            message = self._read_json(deadline)
+            if message.get("id") != command_id:
+                self.pending.append(message)
+                continue
+            if "error" in message:
+                raise WatchError("cdp-error")
+            return message.get("result", {})
+
+    def _read_json(self, deadline: float) -> dict:
+        while True:
             opcode, payload = self._frame(deadline)
             if opcode == 0x9:  # ping
                 self.sock.sendall(_masked_frame(payload, opcode=0xA))
@@ -148,28 +356,17 @@ class CDP:
                 message = json.loads(payload)
             except (TypeError, ValueError):
                 continue
-            if message.get("id") != command_id:
-                continue
-            if "error" in message:
-                raise WatchError("cdp-error")
-            return message.get("result", {})
+            return message
 
     def next_message(self, deadline: float) -> dict:
         while True:
-            opcode, payload = self._frame(deadline)
-            if opcode == 0x9:
-                self.sock.sendall(_masked_frame(payload, opcode=0xA))
-                continue
-            if opcode == 0x8:
-                raise WatchError("cdp-error")
-            if opcode != 0x1:
-                continue
-            try:
-                message = json.loads(payload)
-            except (TypeError, ValueError):
-                continue
+            if self.pending:
+                message = self.pending.popleft()
+            else:
+                message = self._read_json(deadline)
             if "method" in message:
                 return message
+            self.pending.append(message)
 
 
 def parse_flow_body(body: str) -> tuple[int | float, int | float]:
@@ -187,40 +384,86 @@ def parse_flow_body(body: str) -> tuple[int | float, int | float]:
     return values
 
 
-def observe_flow(ws_url: str) -> dict:
+def observe_flow(ws_url: str) -> list[dict]:
     cdp = CDP(ws_url)
     deadline = time.monotonic() + WATCH_TIMEOUT
-    request_ids: set[str] = set()
+    request_ids: dict[str, str] = {}
+    responses: dict[str, dict] = {}
+    bodies: dict[str, str] = {}
+    sections: list[dict] = []
+    cutoff = deadline
     try:
         cdp.call("Network.enable", {}, deadline)
         while True:
-            message = cdp.next_message(deadline)
+            if sections and time.monotonic() >= cutoff:
+                return sections
+            message = cdp.next_message(min(deadline, cutoff))
             params = message.get("params", {})
             if message.get("method") == "Network.requestWillBeSent":
                 request = params.get("request", {})
                 request_url = request.get("url", "")
                 path = urllib.parse.urlsplit(request_url).path
-                if request.get("method") == "GET" and path == FLOW_PATH:
-                    request_ids.add(str(params.get("requestId", "")))
+                if request.get("method") == "GET":
+                    kind = ("wan" if is_flow_url(request_url) else
+                            "devices" if is_api_url(request_url, DEVICE_PATH) else
+                            "ip-flow" if is_api_url(request_url, IP_FLOW_PATH) else
+                            "warn" if is_api_url(request_url, WARN_PATH) else
+                            f"history-{is_history_url(request_url)}" if is_history_url(request_url) else None)
+                    if kind:
+                        request_ids[str(params.get("requestId", ""))] = kind
                 continue
             if message.get("method") != "Network.responseReceived":
+                if message.get("method") == "Network.loadingFinished":
+                    request_id = str(params.get("requestId", ""))
+                    response = responses.get(request_id)
+                    kind = request_ids.get(request_id)
+                    if response is None or kind is None:
+                        continue
+                    if response.get("status") != 200:
+                        status = "unauthorized" if response.get("status") in (401, 403) else "http-error"
+                        sections.append({"section": section_name(kind), "ok": False, "status": status, "error": status, "ts": time.time()})
+                        cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                        continue
+                    try:
+                        result = None
+                        while result is None:
+                            try:
+                                result = cdp.call("Network.getResponseBody", {"requestId": request_id}, min(deadline, cutoff))
+                            except WatchError:
+                                if time.monotonic() >= min(deadline, cutoff):
+                                    raise WatchError("body-unavailable")
+                                continue
+                    except WatchError as error:
+                        status = str(error) if str(error) in SAFE_STATUSES else "body-unavailable"
+                        sections.append({"section": section_name(kind), "ok": False, "status": status, "error": status, "ts": time.time()})
+                        cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                        continue
+                    body = result.get("body", "")
+                    if result.get("base64Encoded"):
+                        try:
+                            body = base64.b64decode(body).decode()
+                        except (ValueError, UnicodeDecodeError):
+                            sections.append({"section": section_name(kind), "ok": False, "status": "invalid-body", "error": "invalid-body", "ts": time.time()})
+                            cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                            continue
+                    emitted = replay_section(kind, body, bodies, sections)
+                    if emitted:
+                        cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                    if kind == "wan" and sections and sections[-1].get("ok") is True:
+                        return sections
+                    if kind in ("devices", "ip-flow") and "devices" in bodies and "ip-flow" in bodies:
+                        return sections
                 continue
             request_id = str(params.get("requestId", ""))
             response = params.get("response", {})
             path = urllib.parse.urlsplit(response.get("url", "")).path
-            if request_id not in request_ids or path != FLOW_PATH:
+            if request_id not in request_ids:
                 continue
-            if response.get("status") != 200:
-                raise WatchError(f"http-{response.get('status', 'error')}")
-            result = cdp.call("Network.getResponseBody", {"requestId": request_id}, deadline)
-            body = result.get("body", "")
-            if result.get("base64Encoded"):
-                try:
-                    body = base64.b64decode(body).decode()
-                except (ValueError, UnicodeDecodeError):
-                    raise WatchError("invalid-body")
-            up, down = parse_flow_body(body)
-            return {"ok": True, "reachable": True, "up": up, "down": down, "ts": time.time()}
+            responses[request_id] = response
+    except TimeoutError:
+        if sections:
+            return sections
+        raise
     finally:
         cdp.close()
 
@@ -228,20 +471,64 @@ def observe_flow(ws_url: str) -> dict:
 def snapshot() -> dict:
     ws_url, error = cdp_websocket_url()
     if not ws_url:
-        return {"error": error}
+        return {"ok": False, "reachable": False, "status": error, "error": error, "ts": time.time()}
     try:
-        return observe_flow(ws_url)
+        results = observe_flow(ws_url)
+        return results
     except TimeoutError:
-        return {"error": "timeout"}
+        return {"ok": False, "reachable": False, "status": "timeout", "error": "timeout", "ts": time.time()}
     except WatchError as error:
-        return {"error": str(error)}
+        safe = str(error) if str(error) in SAFE_STATUSES else "cdp-error"
+        return {"ok": False, "reachable": False, "status": safe, "error": safe, "ts": time.time()}
     except Exception:
-        return {"error": "cdp-error"}
+        return {"ok": False, "reachable": False, "status": "cdp-error", "error": "cdp-error", "ts": time.time()}
 
 
 def selfcheck() -> None:
-    assert parse_flow_body('{"code":0,"wan_up":0,"wan_down":0}') == (0, 0)
+    fixture_dir = Path(__file__).resolve().parent.parent / "fixtures" / "pgybox-watch"
+    assert parse_flow_body((fixture_dir / "flow-ok.json").read_text()) == (0, 1536)
+    device_data = parse_devices((fixture_dir / "devices.json").read_text(), (fixture_dir / "ip-flow.json").read_text())
+    assert device_data["online"] == 2 and device_data["active"] == 1
+    assert device_data["top"][0] == {"name": "Alpha", "up": 10.0, "down": 20.0}
+    assert parse_devices('{"code":0,"eth_data":[],"guest_wifi_data":[],"wifi5g_data":[],"wifi_data":[]}')["online"] == 0
+    try:
+        parse_devices('{"code":0,"eth_data":[{"ip":"192.0.2.1"}],"guest_wifi_data":[],"wifi5g_data":[],"wifi_data":[]}', '{"code":0,"lan_data":[{"ip":"192.0.2.1","up":-1,"down":0}]}')
+    except WatchError:
+        pass
+    else:
+        raise AssertionError("negative device rate accepted")
+    traffic = parse_traffic((fixture_dir / "traffic-7.json").read_text(), (fixture_dir / "traffic-30.json").read_text(), (fixture_dir / "flow-warn.json").read_text())
+    assert traffic["days7"] == 150 and traffic["days30"] == 175 and traffic["used"] == 150 and traffic["limit"] == 200
+    try:
+        parse_traffic('{"list":[{"flow":-1}]}', None, None)
+    except WatchError:
+        pass
+    else:
+        raise AssertionError("negative traffic accepted")
+    try:
+        parse_traffic('{"list":[{"flow":"NaN"}]}', None, None)
+    except WatchError:
+        pass
+    else:
+        raise AssertionError("nonfinite traffic accepted")
+    assert parse_traffic('{"list":[]}', None, None)["days7"] == 0
+    assert parse_traffic(None, None, '{"code":0,"data":[]}') == {"used": None, "limit": None, "warning": False}
+    assert parse_traffic(None, None, '{"code":0,"data":[{}]}') == {"used": None, "limit": None, "warning": False}
+    assert [parse_enabled(v) for v in (0, 1, "0", "1", False, True)] == [False, True, False, True, False, True]
+    for bad_enabled in ("yes", 2, None, 1.0):
+        try:
+            parse_enabled(bad_enabled)
+        except WatchError:
+            pass
+        else:
+            raise AssertionError("invalid enabled value accepted")
     assert parse_flow_body('{"code":0,"wan_up":1.5,"wan_down":2}') == (1.5, 2)
+    try:
+        parse_flow_body((fixture_dir / "flow-invalid.json").read_text())
+    except WatchError:
+        pass
+    else:
+        raise AssertionError("flow-invalid fixture accepted")
     for body in ('{"code":1}', '{"code":0}', '{"code":0,"wan_up":"0","wan_down":0}'):
         try:
             parse_flow_body(body)
@@ -249,7 +536,45 @@ def selfcheck() -> None:
             pass
         else:
             raise AssertionError(body)
-    assert urllib.parse.urlsplit("https://www.pgybox.com/api/flowrate_wan_get?x=1").path == FLOW_PATH
+    assert is_flow_url("https://pgyboxapi.sdwan.oray.com/api/flowrate_wan_get?x=1")
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/lan_device_get", DEVICE_PATH)
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/flowrate_ip_get", IP_FLOW_PATH)
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/flow_warn_get", WARN_PATH)
+    assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=7&sim=1") == 7
+    assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=30&sim=1") == 30
+    assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=8&sim=1") is None
+    assert not is_flow_url("http://pgyboxapi.sdwan.oray.com/api/flowrate_wan_get")
+    assert not is_flow_url("https://www.pgybox.com/api/flowrate_wan_get")
+    assert not is_flow_url("https://evil-pgyboxapi.sdwan.oray.com/api/flowrate_wan_get")
+    assert not is_flow_url("https://pgyboxapi.sdwan.oray.com/other")
+    replay_bodies, replay_sections = {}, []
+    assert replay_section("devices", (fixture_dir / "devices.json").read_text(), replay_bodies, replay_sections) is False
+    assert replay_section("ip-flow", (fixture_dir / "ip-flow.json").read_text(), replay_bodies, replay_sections) is True
+    assert replay_sections[-1]["section"] == "devices"
+    assert replay_section("history-7", (fixture_dir / "traffic-7.json").read_text(), replay_bodies, replay_sections) is True
+    assert replay_sections[-1]["data"] == {"days7": 150}
+    assert replay_section("history-30", (fixture_dir / "traffic-30.json").read_text(), replay_bodies, replay_sections) is True
+    assert replay_sections[-1]["data"] == {"days30": 175}
+    assert replay_section("warn", (fixture_dir / "flow-warn.json").read_text(), replay_bodies, replay_sections) is True
+    assert replay_sections[-1]["data"]["used"] == 150
+    before = len(replay_sections)
+    assert replay_section("warn", '{"code":0,"data":[{"enabled":"bad"}]}', replay_bodies, replay_sections) is True
+    assert replay_sections[-1]["section"] == "traffic" and replay_sections[-1]["ok"] is False and len(replay_sections) == before + 1
+    mapping = json.loads((fixture_dir / "claim-tabs.json").read_text())
+    assert claimed_cdp_target(mapping["claimedTabId"], mapping["cdpTabs"]) == mapping["expectedWebSocket"]
+    assert claimed_cdp_target("short-display-id", mapping["cdpTabs"]) is None
+    old = {"data": {"up": 1, "down": 2, "ts": 1}, "lastSuccessTs": 1}
+    lost = section_transition(old, {"status": "timeout"})
+    assert lost["data"] == old["data"] and lost["reachable"] is False and lost["status"] == "timeout"
+    recovered = section_transition(lost, {"ok": True, "reachable": True, "up": 0, "down": 3, "ts": 2})
+    assert recovered["reachable"] is True and recovered["status"] == "ok" and recovered["data"]["up"] == 0
+    assert "Network.loadingFinished" in Path(__file__).read_text()
+    assert "pending" in Path(__file__).read_text()
+    secret_words = ("authorization", "cookie", "bearer", "x-auth-verification", "daemon token")
+    for fixture in fixture_dir.glob("*.json"):
+        content = fixture.read_text().lower()
+        assert not any(word in content for word in secret_words), fixture
+    assert snapshot.__name__ == "snapshot"
     print("pgybox-watch selfcheck: OK")
 
 
@@ -258,8 +583,10 @@ def main() -> int:
         selfcheck()
         return 0
     result = snapshot()
-    print(json.dumps(result, separators=(",", ":"), ensure_ascii=False))
-    return 0 if result.get("ok") else 1
+    results = result if isinstance(result, list) else [result]
+    for item in results:
+        print(json.dumps(item, separators=(",", ":"), ensure_ascii=False))
+    return 0 if any(item.get("ok") for item in results) else 1
 
 
 if __name__ == "__main__":
