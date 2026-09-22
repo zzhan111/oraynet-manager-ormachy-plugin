@@ -135,7 +135,7 @@ git diff
 50% = 3 / 6
 ```
 
-本轮已完成 M1–M4 的实现与验收，因此进度为 `4 / 6 = 66.7%`。
+本轮已完成 M1–M5 的实现与验收，因此进度为 `5 / 6 = 83.3%`。
 
 M1 证据：
 
@@ -146,17 +146,19 @@ M1 证据：
 - `fixtures/pgybox-watch/flow-ok.json`、`flow-invalid.json` 与 `claim-tabs.json` 支持无账号离线回归；fixture 不含真实设备标识或认证字段。
 - 离线检查命令：`python3 bin/pgybox-watch --selfcheck`、`python3 bin/pgybox-open --selfcheck`、`python3 -m py_compile bin/pgybox-watch bin/pgybox-open`、`git diff --check`。
 
-M1–M3 的真实浏览器与 Omarchy shell 生命周期证据记录如下；M4 仍须单独验收。
+M1–M5 的真实浏览器与 Omarchy shell 生命周期证据记录如下。
 
 M2/M3 contract notes: device data is observed from `/en/deviceList` (`/api/lan_device_get` and `/api/flowrate_ip_get`); traffic data is observed from `/en/networkSettings/flowManage` (`/devices/-/cpe/flows` and `/api/flow_warn_get`). These remain passive GET observations only.
 
 M4 contract notes: DHCP data is observed from `/en/networkSettings/DHCPSettings` (`/api/dhcp_get_ex`) using only the `lan` interface. MACs, names, aliases, and lease IPs are never emitted. Passive navigation remains a limitation: the watcher does not navigate or trigger requests, so the user must visit the relevant page for its natural GET response to exist.
 
+M5 contract notes: component health is observed only from `/en/systemSettings/componentUpgrade` using the three exact API responses; firmware uses only stable `https://clientapi.sdwan.oray.com/softwares/PGY_ORAYBOX` responses. No upgrade endpoint, URL, MD5, log, or write action is used.
+
 Collector evidence: WAN success cuts off immediately; device summaries require both device-list and IP-flow bodies; traffic emits field-preserving patches within a short settle window. Body and parser failures carry their section name, and offline replay covers route matching, dependency order, prompt cutoff, patch merging, isolated failures, empty data, invalid numeric values, and `enabled` normalization.
 
-## 66.7% 实现记录
+## 83.3% 实现记录
 
-2026-09-22 完成 M1–M4 实现，进度为 `4 / 6 = 66.7%`。
+2026-09-22 完成 M1–M5 实现与验收，进度为 `5 / 6 = 83.3%`。
 
 离线证据：
 
@@ -183,12 +185,19 @@ M4 DHCP 真实生命周期证据：
 - Omarchy shell 合并 DHCP 区块后保持 `page-ok`，面板加载无新的 PgyBox QML 错误。
 - watcher 仅输出启用状态、计数、容量和估算比例；未输出租约 IP、MAC 或设备名称。
 
-## 剩余 33.3%
+M5 版本健康真实生命周期证据：
+
+- 组件升级页约 10 秒内合并稳定固件与三个组件响应，未丢失一次性事件。
+- 真实结果为 9 个组件、1 个待更新组件 `repair-patch`；alpha 候选未计入。
+- 稳定固件查询返回 HTTP 204，当前版本 `6.4.0`，正确显示为无更新。
+- Omarchy shell 字段级合并组件与固件 patch，版本区块为 `ok`，无新的 PgyBox QML 错误。
+- watcher 未输出下载 URL、MD5、升级日志或认证信息，也未调用升级接口。
+
+## 剩余 16.7%
 
 未完成里程碑：
 
-1. M5 版本健康：组件待更新数与固件更新提示。
-2. M6 按需诊断：仅在用户明确触发后运行 ping/traceroute。
+1. M6 按需诊断：仅在用户明确触发后运行 ping/traceroute。
 
 已知风险与限制：
 
@@ -200,4 +209,4 @@ M4 DHCP 真实生命周期证据：
 - 已验证当前实际 bar 布局；另一方向 bar 的视觉布局尚未做真实截图验收。
 - 登录、设备名与流量值仅在本机内存/IPC 中使用；fixture 和仓库未保存真实标识或认证信息。
 
-当前无阻塞 M1–M4 使用的问题；其余项目属于剩余范围或后续兼容性风险。
+当前无阻塞 M1–M5 使用的问题；M6 属于剩余范围，其他项目属于后续兼容性风险。

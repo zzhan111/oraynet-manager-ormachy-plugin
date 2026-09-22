@@ -24,6 +24,7 @@ Panel {
   property var devicesState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property var trafficState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property var dhcpState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
+  property var updatesState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property bool ratesCollapsed: false
   property double nowSec: Date.now() / 1000
   property bool demoMode: false
@@ -47,8 +48,9 @@ Panel {
   readonly property var trafficData: trafficState.data || ({})
   readonly property bool trafficFresh: !!trafficState.data && trafficState.status === "ok" && (nowSec - Number(trafficState.lastSuccessTs || 0) < freshWindowSec)
   readonly property bool dhcpFresh: !!dhcpState.data && dhcpState.status === "ok" && (nowSec - Number(dhcpState.lastSuccessTs || 0) < freshWindowSec)
+  readonly property bool updatesFresh: !!updatesState.data && updatesState.status === "ok" && (nowSec - Number(updatesState.lastSuccessTs || 0) < freshWindowSec)
   readonly property bool available: ["no-claimed-tab", "no-pgybox-page", "no-browser", "unauthorized"].indexOf(wanState.status) < 0
-    && (fresh || devicesFresh || trafficFresh || dhcpFresh)
+    && (fresh || devicesFresh || trafficFresh || dhcpFresh || updatesFresh)
   readonly property string statusText: {
     if (demoMode) return "正常"
     if (wanState.status === "no-claimed-tab" || wanState.status === "no-pgybox-page") return "页面未打开"
@@ -116,7 +118,7 @@ Panel {
     try {
       var parsed = JSON.parse(String(text || ""))
       var sectionError = function(value) {
-        var allowed = ["timeout", "unauthorized", "invalid-json", "devices-api-error", "devices-invalid", "traffic-invalid", "dhcp-api-error", "dhcp-invalid", "body-unavailable", "http-error", "cdp-error"]
+        var allowed = ["timeout", "unauthorized", "invalid-json", "devices-api-error", "devices-invalid", "traffic-invalid", "dhcp-api-error", "dhcp-invalid", "updates-api-error", "updates-invalid", "firmware-invalid", "body-unavailable", "http-error", "cdp-error"]
         return allowed.indexOf(String(value || "")) >= 0 ? String(value) : "error"
       }
       if (parsed && parsed.section === "devices") {
@@ -137,6 +139,13 @@ Panel {
         root.dhcpState = parsed.ok === true
           ? ({data: parsed.data, lastSuccessTs: Number(parsed.ts || Date.now() / 1000), status: "ok", error: "", reachable: true})
           : ({data: root.dhcpState.data, lastSuccessTs: root.dhcpState.lastSuccessTs, status: sectionError(parsed.status), error: sectionError(parsed.error || parsed.status), reachable: false})
+        if (parsed.ok === true) root.markPageReachable()
+        return
+      }
+      if (parsed && parsed.section === "updates") {
+        root.updatesState = parsed.ok === true
+          ? ({data: Object.assign({}, root.updatesState.data || {}, parsed.data || {}), lastSuccessTs: Number(parsed.ts || Date.now() / 1000), status: "ok", error: "", reachable: true})
+          : ({data: root.updatesState.data, lastSuccessTs: root.updatesState.lastSuccessTs, status: sectionError(parsed.status), error: sectionError(parsed.error || parsed.status), reachable: false})
         if (parsed.ok === true) root.markPageReachable()
         return
       }
@@ -410,6 +419,19 @@ Panel {
           Text { visible: !root.dhcpState.data; text: root.dhcpState.status === "no-data" ? "暂无 DHCP 数据" : "DHCP 数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
           Text { visible: !!root.dhcpState.data && !root.dhcpFresh; text: "DHCP 数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
         }
+        Rectangle { width: parent.width; height: 1; color: root.faint }
+        Column {
+          width: parent.width
+          spacing: Style.space(3)
+          Text { text: "版本健康"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          DetailRow { label: "组件总数"; value: root.updatesState.data && root.updatesState.data.total !== undefined ? String(root.updatesState.data.total) : "—" }
+          DetailRow { label: "待更新"; value: root.updatesState.data && root.updatesState.data.pending !== undefined ? String(root.updatesState.data.pending) : "—" }
+          Repeater { model: root.updatesState.data && root.updatesState.data.pendingNames ? root.updatesState.data.pendingNames : []; delegate: DetailRow { label: "待更新"; value: modelData } }
+          DetailRow { label: "当前固件"; value: root.updatesState.data && root.updatesState.data.firmwareCurrent ? root.updatesState.data.firmwareCurrent : "—" }
+          DetailRow { label: "固件更新"; value: root.updatesState.data && root.updatesState.data.firmwareUpdate !== undefined ? (root.updatesState.data.firmwareUpdate ? (root.updatesState.data.firmwareAvailable || "有更新") : "最新") : "—"; alert: !!(root.updatesState.data && root.updatesState.data.firmwareUpdate) }
+          Text { visible: !root.updatesState.data; text: root.updatesState.status === "no-data" ? "暂无版本数据" : "版本数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          Text { visible: !!root.updatesState.data && !root.updatesFresh; text: "版本数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+        }
       }
     }
   }
@@ -447,6 +469,6 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
     function demo(): string { root.demoMode = !root.demoMode; if (root.demoMode && !root.opened) root.open(); return root.demoMode ? "demo" : "live" }
-    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, dhcp: root.dhcpState, display: root.display, demo: root.demoMode}) }
+    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, dhcp: root.dhcpState, updates: root.updatesState, display: root.display, demo: root.demoMode}) }
   }
 }

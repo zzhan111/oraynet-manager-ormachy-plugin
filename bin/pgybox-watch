@@ -4,6 +4,7 @@
 import base64
 import json
 import ipaddress
+import re
 import math
 import os
 import select
@@ -25,11 +26,17 @@ IP_FLOW_PATH = "/api/flowrate_ip_get"
 FLOW_HISTORY_PATH = "/devices/-/cpe/flows"
 WARN_PATH = "/api/flow_warn_get"
 DHCP_PATH = "/api/dhcp_get_ex"
+COMPONENT_MODULE_PATH = "/component/get_component_module"
+PACKAGE_UPGRADE_PATH = "/api/package_upgrade_list"
+COMPONENT_PATH = "/component/get_component"
+FIRMWARE_PATH = "/softwares/PGY_ORAYBOX"
+FIRMWARE_HOST = "clientapi.sdwan.oray.com"
 WATCH_TIMEOUT = 25.0
 SETTLE_TIMEOUT = 2.0
 SAFE_STATUSES = {"no-claimed-tab", "no-pgybox-page", "no-browser", "timeout", "unauthorized",
                  "invalid-json", "api-code-not-zero", "invalid-wan-rate", "body-unavailable",
-                 "invalid-body", "http-error", "cdp-error", "dhcp-api-error", "dhcp-invalid"}
+                 "invalid-body", "http-error", "cdp-error", "dhcp-api-error", "dhcp-invalid",
+                 "updates-api-error", "updates-invalid", "firmware-invalid"}
 
 
 class WatchError(RuntimeError):
@@ -84,6 +91,17 @@ def is_flow_url(url: str) -> bool:
 def is_api_url(url: str, path: str) -> bool:
     parsed = urllib.parse.urlsplit(url)
     return parsed.scheme == "https" and parsed.hostname == PGYBOX_API_HOST and parsed.port in (None, 443) and parsed.path == path
+
+
+def is_firmware_url(url: str) -> str | None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != FIRMWARE_HOST or parsed.port not in (None, 443) or parsed.path != FIRMWARE_PATH:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    versions = query.get("versionno")
+    if query.get("versiontype") != ["stable"] or not versions or not versions[0]:
+        return None
+    return versions[0]
 
 
 def is_history_url(url: str) -> int | None:
@@ -227,6 +245,95 @@ def parse_dhcp(body: str) -> dict:
     return {"enabled": True, "active": active, "pool": pool, "utilization": min(1.0, active / pool), "estimated": True}
 
 
+def safe_text(value, required=True) -> str:
+    if not isinstance(value, str) or (required and not value.strip()) or len(value) > 160 or "\n" in value or "\r" in value or "://" in value:
+        raise WatchError("updates-invalid")
+    return value.strip()
+
+
+def strict_bool(value) -> bool:
+    if type(value) is not bool:
+        raise WatchError("updates-invalid")
+    return value
+
+
+def strict_bit(value) -> bool:
+    if type(value) is not int or value not in (0, 1):
+        raise WatchError("updates-invalid")
+    return bool(value)
+
+
+def version_parts(value: str) -> tuple[int, ...]:
+    base = value.split("-", 1)[0]
+    if not re.fullmatch(r"\d+(?:\.\d+)*", base):
+        raise WatchError("updates-invalid")
+    return tuple(int(part) for part in base.split("."))
+
+
+def version_compare(left: str, right: str) -> int:
+    a, b = version_parts(left), version_parts(right)
+    size = max(len(a), len(b))
+    a, b = a + (0,) * (size - len(a)), b + (0,) * (size - len(b))
+    return (a > b) - (a < b)
+
+
+def parse_components(module_body: str, package_body: str, component_body: str) -> dict:
+    modules, packages, components = json.loads(module_body), json.loads(package_body), json.loads(component_body)
+    if not isinstance(modules, list) or not isinstance(components, list) or not isinstance(packages, dict) or packages.get("code") != 0 or not isinstance(packages.get("data"), list):
+        raise WatchError("updates-api-error")
+    names = {}
+    for row in modules:
+        if not isinstance(row, dict):
+            raise WatchError("updates-invalid")
+        key = safe_text(row.get("key"))
+        valid, shown = strict_bit(row.get("isValid")), strict_bit(row.get("isShow"))
+        ext = row.get("extends")
+        if not isinstance(ext, dict):
+            raise WatchError("updates-invalid")
+        name = safe_text(ext.get("en_name"), False) or safe_text(row.get("name"), False)
+        if valid and shown and name:
+            names[key] = name
+    installed = {}
+    for row in packages["data"]:
+        if not isinstance(row, dict):
+            raise WatchError("updates-invalid")
+        key, version = safe_text(row.get("packagename")), safe_text(row.get("version"))
+        version_parts(version)
+        if key in installed:
+            raise WatchError("updates-invalid")
+        installed[key] = version
+    candidates, candidate_names = {}, {}
+    for row in components:
+        if not isinstance(row, dict):
+            raise WatchError("updates-invalid")
+        key, version = safe_text(row.get("Key")), safe_text(row.get("Version"))
+        name, alpha = safe_text(row.get("Name"), False), strict_bool(row.get("IsAlpha"))
+        version_parts(version)
+        if alpha:
+            continue
+        if key not in candidates or version_compare(version, candidates[key]) > 0:
+            candidates[key] = version
+            candidate_names[key] = name
+    pending_keys = [key for key, version in candidates.items()
+                    if key not in installed or version_compare(version, installed[key]) > 0]
+    pending_names = [names.get(key) or candidate_names.get(key) or key for key in pending_keys]
+    return {"total": len(set(installed) | set(candidates)), "pending": len(pending_keys),
+            "pendingNames": sorted(pending_names, key=lambda value: (value.casefold(), value))}
+
+
+def parse_firmware(body: str, current: str, status: int) -> dict:
+    current = safe_text(current); version_parts(current)
+    if status == 204:
+        return {"firmwareCurrent": current, "firmwareAvailable": None, "firmwareUpdate": False}
+    if status != 200:
+        raise WatchError("http-error")
+    payload = json.loads(body)
+    if not isinstance(payload, dict): raise WatchError("firmware-invalid")
+    available = safe_text(payload.get("versionno")); version_parts(available)
+    return {"firmwareCurrent": current, "firmwareAvailable": available,
+            "firmwareUpdate": version_compare(available, current) > 0}
+
+
 def section_transition(previous: dict, result: dict) -> dict:
     """Apply one sanitized watcher result without discarding the last good data."""
     if result.get("ok") is True and result.get("reachable") is True:
@@ -238,7 +345,7 @@ def section_transition(previous: dict, result: dict) -> dict:
 
 
 def section_name(kind: str) -> str:
-    return "wan" if kind == "wan" else "devices" if kind in ("devices", "ip-flow") else "dhcp" if kind == "dhcp" else "traffic"
+    return "wan" if kind == "wan" else "devices" if kind in ("devices", "ip-flow") else "dhcp" if kind == "dhcp" else "updates" if kind.startswith("component") or kind == "firmware" else "traffic"
 
 
 def replay_section(kind: str, body: str, bodies: dict[str, str], sections: list[dict]) -> bool:
@@ -263,6 +370,18 @@ def replay_section(kind: str, body: str, bodies: dict[str, str], sections: list[
             data = parse_dhcp(body)
             sections.append({"section": "dhcp", "ok": True, "status": "ok", "data": data, "ts": now})
             return True
+        elif kind == "firmware":
+            current = bodies.pop("firmware-current")
+            status = int(bodies.pop("firmware-status"))
+            data = parse_firmware(body, current, status)
+            sections.append({"section": "updates", "ok": True, "status": "ok", "data": data, "ts": now})
+            return True
+        elif kind.startswith("component"):
+            if all(name in bodies for name in ("component-module", "component-package", "component-installed")):
+                data = parse_components(bodies["component-module"], bodies["component-package"], bodies["component-installed"])
+                sections.append({"section": "updates", "ok": True, "status": "ok", "data": data, "ts": now})
+                return True
+            return False
         else:
             return False
         sections.append({"section": "traffic", "ok": True, "status": "ok", "data": data, "ts": now})
@@ -434,6 +553,7 @@ def observe_flow(ws_url: str) -> list[dict]:
     responses: dict[str, dict] = {}
     bodies: dict[str, str] = {}
     sections: list[dict] = []
+    update_done: set[str] = set()
     cutoff = deadline
     try:
         cdp.call("Network.enable", {}, deadline)
@@ -452,6 +572,10 @@ def observe_flow(ws_url: str) -> list[dict]:
                             "ip-flow" if is_api_url(request_url, IP_FLOW_PATH) else
                             "warn" if is_api_url(request_url, WARN_PATH) else
                             "dhcp" if is_api_url(request_url, DHCP_PATH) else
+                            "component-module" if is_api_url(request_url, COMPONENT_MODULE_PATH) else
+                            "component-package" if is_api_url(request_url, PACKAGE_UPGRADE_PATH) else
+                            "component-installed" if is_api_url(request_url, COMPONENT_PATH) else
+                            "firmware" if is_firmware_url(request_url) else
                             f"history-{is_history_url(request_url)}" if is_history_url(request_url) else None)
                     if kind:
                         request_ids[str(params.get("requestId", ""))] = kind
@@ -464,9 +588,22 @@ def observe_flow(ws_url: str) -> list[dict]:
                     if response is None or kind is None:
                         continue
                     if response.get("status") != 200:
+                        if kind == "firmware" and response.get("status") == 204:
+                            bodies["firmware-current"] = is_firmware_url(response.get("url", ""))
+                            bodies["firmware-status"] = "204"
+                            replay_section(kind, "", bodies, sections)
+                            update_done.add("firmware")
+                            if "components" in update_done:
+                                return sections
+                            continue
                         status = "unauthorized" if response.get("status") in (401, 403) else "http-error"
                         sections.append({"section": section_name(kind), "ok": False, "status": status, "error": status, "ts": time.time()})
-                        cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                        if section_name(kind) == "updates":
+                            update_done.add("firmware" if kind == "firmware" else "components")
+                            if len(update_done) == 2:
+                                return sections
+                        else:
+                            cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
                         continue
                     try:
                         result = None
@@ -480,7 +617,12 @@ def observe_flow(ws_url: str) -> list[dict]:
                     except WatchError as error:
                         status = str(error) if str(error) in SAFE_STATUSES else "body-unavailable"
                         sections.append({"section": section_name(kind), "ok": False, "status": status, "error": status, "ts": time.time()})
-                        cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                        if section_name(kind) == "updates":
+                            update_done.add("firmware" if kind == "firmware" else "components")
+                            if len(update_done) == 2:
+                                return sections
+                        else:
+                            cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
                         continue
                     body = result.get("body", "")
                     if result.get("base64Encoded"):
@@ -488,14 +630,29 @@ def observe_flow(ws_url: str) -> list[dict]:
                             body = base64.b64decode(body).decode()
                         except (ValueError, UnicodeDecodeError):
                             sections.append({"section": section_name(kind), "ok": False, "status": "invalid-body", "error": "invalid-body", "ts": time.time()})
-                            cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
+                            if section_name(kind) == "updates":
+                                update_done.add("firmware" if kind == "firmware" else "components")
+                                if len(update_done) == 2:
+                                    return sections
+                            else:
+                                cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
                             continue
+                    if kind == "firmware":
+                        request_url = responses[request_id].get("url", "")
+                        bodies["firmware-current"] = is_firmware_url(request_url)
+                        bodies["firmware-status"] = str(response.get("status"))
                     emitted = replay_section(kind, body, bodies, sections)
-                    if emitted:
+                    if kind == "firmware":
+                        update_done.add("firmware")
+                    elif kind.startswith("component") and all(name in bodies for name in ("component-module", "component-package", "component-installed")):
+                        update_done.add("components")
+                    if emitted and section_name(kind) != "updates":
                         cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
                     if kind == "wan" and sections and sections[-1].get("ok") is True:
                         return sections
                     if kind == "dhcp" and sections and sections[-1].get("section") == "dhcp" and sections[-1].get("ok") is True:
+                        return sections
+                    if len(update_done) == 2:
                         return sections
                     if kind in ("devices", "ip-flow") and "devices" in bodies and "ip-flow" in bodies:
                         return sections
@@ -547,13 +704,22 @@ def selfcheck() -> None:
     assert dhcp["enabled"] is True and dhcp["active"] == 3 and dhcp["pool"] == 4 and dhcp["utilization"] == 0.75 and dhcp["estimated"] is True
     assert parse_dhcp((fixture_dir / "dhcp-disabled.json").read_text()) == {"enabled": False, "active": 0, "pool": 4, "utilization": 0.0, "estimated": True}
     assert parse_dhcp('{"code":0,"dhcp":[{"ip_start":1,"ip_end":2,"switch":1,"interface":"lan"}],"rent_users":[{"ip":"192.0.2.1"},{"ip":"192.0.2.2"},{"ip":"192.0.2.3"}]}')["utilization"] == 1.0
-    for bad in ('{"code":0,"dhcp":[],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":true,"ip_end":1,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":2,"ip_end":1,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":1,"ip_end":256,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":1,"ip_end":2,"switch":2,"interface":"lan"}],"rent_users":[]}'):
+    for bad in ('{"code":0,"dhcp":[{"ip_start":true,"ip_end":1,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":2,"ip_end":1,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":1,"ip_end":256,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":1,"ip_end":2,"switch":2,"interface":"lan"}],"rent_users":[]}'):
         try:
             parse_dhcp(bad)
         except WatchError:
-            pass
-        else:
-            raise AssertionError("malformed DHCP accepted")
+            continue
+        raise AssertionError("malformed DHCP accepted")
+    components = parse_components((fixture_dir / "component-module.json").read_text(), (fixture_dir / "component-package.json").read_text(), (fixture_dir / "component-installed.json").read_text())
+    assert components == {"total": 3, "pending": 2, "pendingNames": ["Core", "repair-patch"]}
+    try:
+        parse_components('[{"key":"x","name":"X","isValid":1,"isShow":1,"extends":{"en_name":"X"}}]', '{"code":0,"data":[]}', '[{"Version":"bad.version","Key":"x","Name":"X","IsAlpha":false}]')
+    except WatchError:
+        pass
+    else:
+        raise AssertionError("uncomparable version accepted")
+    assert parse_firmware((fixture_dir / "firmware-204.json").read_text(), "1.0.0-build", 204)["firmwareUpdate"] is False
+    assert parse_firmware((fixture_dir / "firmware-200.json").read_text(), "1.0.0", 200)["firmwareUpdate"] is True
     traffic = parse_traffic((fixture_dir / "traffic-7.json").read_text(), (fixture_dir / "traffic-30.json").read_text(), (fixture_dir / "flow-warn.json").read_text())
     assert traffic["days7"] == 150 and traffic["days30"] == 175 and traffic["used"] == 150 and traffic["limit"] == 200
     try:
@@ -598,6 +764,11 @@ def selfcheck() -> None:
     assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/flowrate_ip_get", IP_FLOW_PATH)
     assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/flow_warn_get", WARN_PATH)
     assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/dhcp_get_ex", DHCP_PATH)
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/component/get_component_module", COMPONENT_MODULE_PATH)
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/package_upgrade_list", PACKAGE_UPGRADE_PATH)
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/component/get_component", COMPONENT_PATH)
+    assert is_firmware_url("https://clientapi.sdwan.oray.com/softwares/PGY_ORAYBOX?versiontype=stable&versionno=1.0.0") == "1.0.0"
+    assert is_firmware_url("https://clientapi.sdwan.oray.com/softwares/PGY_ORAYBOX?versiontype=develop&versionno=1.0.0") is None
     assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=7&sim=1") == 7
     assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=30&sim=1") == 30
     assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=8&sim=1") is None
@@ -612,6 +783,14 @@ def selfcheck() -> None:
     dhcp_sections = []
     assert replay_section("dhcp", (fixture_dir / "dhcp-enabled.json").read_text(), {}, dhcp_sections) is True
     assert dhcp_sections[-1]["section"] == "dhcp" and dhcp_sections[-1]["data"]["active"] == 3
+    update_bodies, update_sections = {}, []
+    assert replay_section("component-module", (fixture_dir / "component-module.json").read_text(), update_bodies, update_sections) is False
+    assert replay_section("component-package", (fixture_dir / "component-package.json").read_text(), update_bodies, update_sections) is False
+    assert replay_section("component-installed", (fixture_dir / "component-installed.json").read_text(), update_bodies, update_sections) is True
+    assert update_sections[-1]["data"]["pending"] == 2
+    update_bodies["firmware-current"], update_bodies["firmware-status"] = "1.0.0", "200"
+    assert replay_section("firmware", (fixture_dir / "firmware-200.json").read_text(), update_bodies, update_sections) is True
+    assert update_sections[-1]["data"]["firmwareUpdate"] is True
     assert replay_section("history-7", (fixture_dir / "traffic-7.json").read_text(), replay_bodies, replay_sections) is True
     assert replay_sections[-1]["data"] == {"days7": 150}
     assert replay_section("history-30", (fixture_dir / "traffic-30.json").read_text(), replay_bodies, replay_sections) is True
