@@ -135,7 +135,7 @@ git diff
 50% = 3 / 6
 ```
 
-本轮已完成 M1、M2、M3 的实现与离线检查，因此实现进度为 `3 / 6 = 50%`；真实生命周期验收仍未宣称通过。
+本轮已完成 M1–M4 的实现与验收，因此进度为 `4 / 6 = 66.7%`。
 
 M1 证据：
 
@@ -146,15 +146,17 @@ M1 证据：
 - `fixtures/pgybox-watch/flow-ok.json`、`flow-invalid.json` 与 `claim-tabs.json` 支持无账号离线回归；fixture 不含真实设备标识或认证字段。
 - 离线检查命令：`python3 bin/pgybox-watch --selfcheck`、`python3 bin/pgybox-open --selfcheck`、`python3 -m py_compile bin/pgybox-watch bin/pgybox-open`、`git diff --check`。
 
-真实浏览器生命周期、Omarchy shell 加载、tab 关闭/重开/claim、登录失效恢复和横纵向面板仍须 live validation；本轮不以离线检查替代该验收。
+M1–M3 的真实浏览器与 Omarchy shell 生命周期证据记录如下；M4 仍须单独验收。
 
 M2/M3 contract notes: device data is observed from `/en/deviceList` (`/api/lan_device_get` and `/api/flowrate_ip_get`); traffic data is observed from `/en/networkSettings/flowManage` (`/devices/-/cpe/flows` and `/api/flow_warn_get`). These remain passive GET observations only.
 
+M4 contract notes: DHCP data is observed from `/en/networkSettings/DHCPSettings` (`/api/dhcp_get_ex`) using only the `lan` interface. MACs, names, aliases, and lease IPs are never emitted. Passive navigation remains a limitation: the watcher does not navigate or trigger requests, so the user must visit the relevant page for its natural GET response to exist.
+
 Collector evidence: WAN success cuts off immediately; device summaries require both device-list and IP-flow bodies; traffic emits field-preserving patches within a short settle window. Body and parser failures carry their section name, and offline replay covers route matching, dependency order, prompt cutoff, patch merging, isolated failures, empty data, invalid numeric values, and `enabled` normalization.
 
-## 50% 验收记录
+## 66.7% 实现记录
 
-2026-09-22 完成 M1–M3，进度为 `3 / 6 = 50%`。
+2026-09-22 完成 M1–M4 实现，进度为 `4 / 6 = 66.7%`。
 
 离线证据：
 
@@ -163,9 +165,8 @@ Collector evidence: WAN success cuts off immediately; device summaries require b
 - `python3 -m py_compile bin/pgybox-watch bin/pgybox-open`：通过。
 - `omarchy plugin validate .`：通过。
 - `git diff --check`：通过。
-- 独立 reviewer 最终 code gate：PASS，无剩余代码正确性阻塞。
 
-真实生命周期证据：
+M1–M3 真实生命周期证据：
 
 - opener 写入的 full `tabId` 与 CDP `/json` target id 一致，精确 host 为 `www.pgybox.com`。
 - 首页 WAN 响应约 5 秒产出成功快照，满足 10 秒更新门槛。
@@ -173,22 +174,30 @@ Collector evidence: WAN success cuts off immediately; device summaries require b
 - 设备页约 9 秒合并真实设备列表与 IP 流速；QML 保留在线数、活跃数和确定排序的 Top 3。
 - 流量页先合并 7 天和本月字段，再在选择 30 天后补入 30 天字段；设备区块未被覆盖。
 - 关闭 claimed tab 后状态变为 `no-pgybox-page`；opener 重开、claim 并刷新后设备区块恢复。
-- 实际 Omarchy shell 可加载、打开、刷新和关闭面板；修复空流量状态后无新的 PgyBox QML 错误。
+- 实际 Omarchy shell 可加载、打开、刷新和关闭面板；当前版本无新的 PgyBox QML 错误。
 
-## 剩余 50%
+M4 DHCP 真实生命周期证据：
+
+- DHCP 页自然产生的 `/api/dhcp_get_ex` 在约 8 秒内输出成功区块。
+- 真实 `lan` 配置解析为已启用、11 个去重活跃租约、151 个地址池容量，估算占用约 7.3%。
+- Omarchy shell 合并 DHCP 区块后保持 `page-ok`，面板加载无新的 PgyBox QML 错误。
+- watcher 仅输出启用状态、计数、容量和估算比例；未输出租约 IP、MAC 或设备名称。
+
+## 剩余 33.3%
 
 未完成里程碑：
 
-1. M4 DHCP 健康：启用状态、活跃租约数、地址池利用率。
-2. M5 版本健康：组件待更新数与固件更新提示。
-3. M6 按需诊断：仅在用户明确触发后运行 ping/traceroute。
+1. M5 版本健康：组件待更新数与固件更新提示。
+2. M6 按需诊断：仅在用户明确触发后运行 ping/traceroute。
 
 已知风险与限制：
 
-- 被动观察不会主动请求数据；用户须访问或刷新设备页，7/30 天数据须分别选择对应页面选项。
+- 被动观察不会主动请求数据；用户须访问或刷新设备/DHCP 页，7/30 天数据须分别选择对应页面选项。
 - 页面 API 字段或 origin 漂移时，严格校验会保留旧数据并显示过期/错误，而不会猜测新格式。
 - `limit_warning == 0` 按“未设置限额”处理；非零限额语义仍需在真实启用限额的账号上复核。
+- DHCP `ip_start/ip_end` 按接口返回的主机位整数解释；超出 `0..255` 时拒绝数据。
+- DHCP 租约记录没有接口字段；“地址池占用（估）”用全部去重 IPv4 租约除以 LAN 池容量并封顶，接口字段可用后再改为精确值。
 - 已验证当前实际 bar 布局；另一方向 bar 的视觉布局尚未做真实截图验收。
 - 登录、设备名与流量值仅在本机内存/IPC 中使用；fixture 和仓库未保存真实标识或认证信息。
 
-当前无阻塞 M1–M3 使用的问题；以上项目属于剩余范围或后续兼容性风险。
+当前无阻塞 M1–M4 使用的问题；其余项目属于剩余范围或后续兼容性风险。

@@ -3,6 +3,7 @@
 # 不取 cookie，不读取或转发认证头，不导航，不触发页面请求。
 import base64
 import json
+import ipaddress
 import math
 import os
 import select
@@ -23,11 +24,12 @@ DEVICE_PATH = "/api/lan_device_get"
 IP_FLOW_PATH = "/api/flowrate_ip_get"
 FLOW_HISTORY_PATH = "/devices/-/cpe/flows"
 WARN_PATH = "/api/flow_warn_get"
+DHCP_PATH = "/api/dhcp_get_ex"
 WATCH_TIMEOUT = 25.0
 SETTLE_TIMEOUT = 2.0
 SAFE_STATUSES = {"no-claimed-tab", "no-pgybox-page", "no-browser", "timeout", "unauthorized",
                  "invalid-json", "api-code-not-zero", "invalid-wan-rate", "body-unavailable",
-                 "invalid-body", "http-error", "cdp-error"}
+                 "invalid-body", "http-error", "cdp-error", "dhcp-api-error", "dhcp-invalid"}
 
 
 class WatchError(RuntimeError):
@@ -188,6 +190,43 @@ def parse_traffic(body7: str | None, body30: str | None, warning_body: str | Non
     return result
 
 
+def parse_dhcp(body: str) -> dict:
+    payload = json.loads(body)
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        raise WatchError("dhcp-api-error")
+    configs = payload.get("dhcp")
+    users = payload.get("rent_users")
+    if not isinstance(configs, list) or not isinstance(users, list):
+        raise WatchError("dhcp-invalid")
+    lan_rows = [row for row in configs if isinstance(row, dict) and row.get("interface") == "lan"]
+    if len(lan_rows) != 1:
+        raise WatchError("dhcp-invalid")
+    lan = lan_rows[0]
+    start, end = lan.get("ip_start"), lan.get("ip_end")
+    if any(isinstance(value, bool) or type(value) is not int or value < 0 or value > 255 for value in (start, end)) or end < start:
+        raise WatchError("dhcp-invalid")
+    try:
+        enabled = parse_enabled(lan.get("switch"))
+    except WatchError:
+        raise WatchError("dhcp-invalid")
+    pool = end - start + 1
+    if not enabled:
+        return {"enabled": False, "active": 0, "pool": pool, "utilization": 0.0, "estimated": True}
+    leases = set()
+    for user in users:
+        if not isinstance(user, dict) or not isinstance(user.get("ip"), str):
+            continue
+        try:
+            address = ipaddress.ip_address(user["ip"])
+        except ValueError:
+            continue
+        if address.version == 4:
+            leases.add(str(address))
+    active = len(leases)
+    # ponytail: API leases lack interface IDs; show capped LAN-pool estimate until the API exposes them.
+    return {"enabled": True, "active": active, "pool": pool, "utilization": min(1.0, active / pool), "estimated": True}
+
+
 def section_transition(previous: dict, result: dict) -> dict:
     """Apply one sanitized watcher result without discarding the last good data."""
     if result.get("ok") is True and result.get("reachable") is True:
@@ -199,7 +238,7 @@ def section_transition(previous: dict, result: dict) -> dict:
 
 
 def section_name(kind: str) -> str:
-    return "wan" if kind == "wan" else "devices" if kind in ("devices", "ip-flow") else "traffic"
+    return "wan" if kind == "wan" else "devices" if kind in ("devices", "ip-flow") else "dhcp" if kind == "dhcp" else "traffic"
 
 
 def replay_section(kind: str, body: str, bodies: dict[str, str], sections: list[dict]) -> bool:
@@ -220,6 +259,10 @@ def replay_section(kind: str, body: str, bodies: dict[str, str], sections: list[
             data = parse_traffic(None, body, None)
         elif kind == "warn":
             data = parse_traffic(None, None, body)
+        elif kind == "dhcp":
+            data = parse_dhcp(body)
+            sections.append({"section": "dhcp", "ok": True, "status": "ok", "data": data, "ts": now})
+            return True
         else:
             return False
         sections.append({"section": "traffic", "ok": True, "status": "ok", "data": data, "ts": now})
@@ -408,6 +451,7 @@ def observe_flow(ws_url: str) -> list[dict]:
                             "devices" if is_api_url(request_url, DEVICE_PATH) else
                             "ip-flow" if is_api_url(request_url, IP_FLOW_PATH) else
                             "warn" if is_api_url(request_url, WARN_PATH) else
+                            "dhcp" if is_api_url(request_url, DHCP_PATH) else
                             f"history-{is_history_url(request_url)}" if is_history_url(request_url) else None)
                     if kind:
                         request_ids[str(params.get("requestId", ""))] = kind
@@ -450,6 +494,8 @@ def observe_flow(ws_url: str) -> list[dict]:
                     if emitted:
                         cutoff = min(cutoff, time.monotonic() + SETTLE_TIMEOUT)
                     if kind == "wan" and sections and sections[-1].get("ok") is True:
+                        return sections
+                    if kind == "dhcp" and sections and sections[-1].get("section") == "dhcp" and sections[-1].get("ok") is True:
                         return sections
                     if kind in ("devices", "ip-flow") and "devices" in bodies and "ip-flow" in bodies:
                         return sections
@@ -497,6 +543,17 @@ def selfcheck() -> None:
         pass
     else:
         raise AssertionError("negative device rate accepted")
+    dhcp = parse_dhcp((fixture_dir / "dhcp-enabled.json").read_text())
+    assert dhcp["enabled"] is True and dhcp["active"] == 3 and dhcp["pool"] == 4 and dhcp["utilization"] == 0.75 and dhcp["estimated"] is True
+    assert parse_dhcp((fixture_dir / "dhcp-disabled.json").read_text()) == {"enabled": False, "active": 0, "pool": 4, "utilization": 0.0, "estimated": True}
+    assert parse_dhcp('{"code":0,"dhcp":[{"ip_start":1,"ip_end":2,"switch":1,"interface":"lan"}],"rent_users":[{"ip":"192.0.2.1"},{"ip":"192.0.2.2"},{"ip":"192.0.2.3"}]}')["utilization"] == 1.0
+    for bad in ('{"code":0,"dhcp":[],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":true,"ip_end":1,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":2,"ip_end":1,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":1,"ip_end":256,"switch":1,"interface":"lan"}],"rent_users":[]}', '{"code":0,"dhcp":[{"ip_start":1,"ip_end":2,"switch":2,"interface":"lan"}],"rent_users":[]}'):
+        try:
+            parse_dhcp(bad)
+        except WatchError:
+            pass
+        else:
+            raise AssertionError("malformed DHCP accepted")
     traffic = parse_traffic((fixture_dir / "traffic-7.json").read_text(), (fixture_dir / "traffic-30.json").read_text(), (fixture_dir / "flow-warn.json").read_text())
     assert traffic["days7"] == 150 and traffic["days30"] == 175 and traffic["used"] == 150 and traffic["limit"] == 200
     try:
@@ -540,6 +597,7 @@ def selfcheck() -> None:
     assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/lan_device_get", DEVICE_PATH)
     assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/flowrate_ip_get", IP_FLOW_PATH)
     assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/flow_warn_get", WARN_PATH)
+    assert is_api_url("https://pgyboxapi.sdwan.oray.com/api/dhcp_get_ex", DHCP_PATH)
     assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=7&sim=1") == 7
     assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=30&sim=1") == 30
     assert is_history_url("https://pgyboxapi.sdwan.oray.com/devices/-/cpe/flows?limit=8&sim=1") is None
@@ -551,6 +609,9 @@ def selfcheck() -> None:
     assert replay_section("devices", (fixture_dir / "devices.json").read_text(), replay_bodies, replay_sections) is False
     assert replay_section("ip-flow", (fixture_dir / "ip-flow.json").read_text(), replay_bodies, replay_sections) is True
     assert replay_sections[-1]["section"] == "devices"
+    dhcp_sections = []
+    assert replay_section("dhcp", (fixture_dir / "dhcp-enabled.json").read_text(), {}, dhcp_sections) is True
+    assert dhcp_sections[-1]["section"] == "dhcp" and dhcp_sections[-1]["data"]["active"] == 3
     assert replay_section("history-7", (fixture_dir / "traffic-7.json").read_text(), replay_bodies, replay_sections) is True
     assert replay_sections[-1]["data"] == {"days7": 150}
     assert replay_section("history-30", (fixture_dir / "traffic-30.json").read_text(), replay_bodies, replay_sections) is True

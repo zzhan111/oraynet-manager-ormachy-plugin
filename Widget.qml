@@ -23,6 +23,7 @@ Panel {
   })
   property var devicesState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property var trafficState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
+  property var dhcpState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property bool ratesCollapsed: false
   property double nowSec: Date.now() / 1000
   property bool demoMode: false
@@ -45,8 +46,9 @@ Panel {
   readonly property bool devicesFresh: !!devicesState.data && devicesState.status === "ok" && (nowSec - Number(devicesState.lastSuccessTs || 0) < freshWindowSec)
   readonly property var trafficData: trafficState.data || ({})
   readonly property bool trafficFresh: !!trafficState.data && trafficState.status === "ok" && (nowSec - Number(trafficState.lastSuccessTs || 0) < freshWindowSec)
+  readonly property bool dhcpFresh: !!dhcpState.data && dhcpState.status === "ok" && (nowSec - Number(dhcpState.lastSuccessTs || 0) < freshWindowSec)
   readonly property bool available: ["no-claimed-tab", "no-pgybox-page", "no-browser", "unauthorized"].indexOf(wanState.status) < 0
-    && (fresh || devicesFresh || trafficFresh)
+    && (fresh || devicesFresh || trafficFresh || dhcpFresh)
   readonly property string statusText: {
     if (demoMode) return "正常"
     if (wanState.status === "no-claimed-tab" || wanState.status === "no-pgybox-page") return "页面未打开"
@@ -114,7 +116,7 @@ Panel {
     try {
       var parsed = JSON.parse(String(text || ""))
       var sectionError = function(value) {
-        var allowed = ["timeout", "unauthorized", "invalid-json", "devices-api-error", "devices-invalid", "traffic-invalid", "body-unavailable", "http-error", "cdp-error"]
+        var allowed = ["timeout", "unauthorized", "invalid-json", "devices-api-error", "devices-invalid", "traffic-invalid", "dhcp-api-error", "dhcp-invalid", "body-unavailable", "http-error", "cdp-error"]
         return allowed.indexOf(String(value || "")) >= 0 ? String(value) : "error"
       }
       if (parsed && parsed.section === "devices") {
@@ -128,6 +130,13 @@ Panel {
         root.trafficState = parsed.ok === true
           ? ({data: Object.assign({}, root.trafficState.data || {}, parsed.data || {}), lastSuccessTs: Number(parsed.ts || Date.now() / 1000), status: "ok", error: "", reachable: true})
           : ({data: root.trafficState.data, lastSuccessTs: root.trafficState.lastSuccessTs, status: sectionError(parsed.status), error: sectionError(parsed.error || parsed.status), reachable: false})
+        if (parsed.ok === true) root.markPageReachable()
+        return
+      }
+      if (parsed && parsed.section === "dhcp") {
+        root.dhcpState = parsed.ok === true
+          ? ({data: parsed.data, lastSuccessTs: Number(parsed.ts || Date.now() / 1000), status: "ok", error: "", reachable: true})
+          : ({data: root.dhcpState.data, lastSuccessTs: root.dhcpState.lastSuccessTs, status: sectionError(parsed.status), error: sectionError(parsed.error || parsed.status), reachable: false})
         if (parsed.ok === true) root.markPageReachable()
         return
       }
@@ -390,6 +399,17 @@ Panel {
           Text { visible: !root.trafficState.data; text: root.trafficState.status === "no-data" ? "暂无流量数据" : "流量数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
           Text { visible: !!root.trafficState.data && !root.trafficFresh; text: "流量数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
         }
+        Rectangle { width: parent.width; height: 1; color: root.faint }
+        Column {
+          width: parent.width
+          spacing: Style.space(3)
+          Text { text: "DHCP"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          DetailRow { label: "状态"; value: root.dhcpState.data ? (root.dhcpState.data.enabled ? "已启用" : "未启用") : "—" }
+          DetailRow { label: "活跃租约"; value: root.dhcpState.data ? String(root.dhcpState.data.active) : "—" }
+          DetailRow { label: "地址池占用（估）"; value: root.dhcpState.data ? Math.round(Number(root.dhcpState.data.utilization || 0) * 100) + "%" : "—" }
+          Text { visible: !root.dhcpState.data; text: root.dhcpState.status === "no-data" ? "暂无 DHCP 数据" : "DHCP 数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+          Text { visible: !!root.dhcpState.data && !root.dhcpFresh; text: "DHCP 数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
+        }
       }
     }
   }
@@ -427,6 +447,6 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
     function demo(): string { root.demoMode = !root.demoMode; if (root.demoMode && !root.opened) root.open(); return root.demoMode ? "demo" : "live" }
-    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, display: root.display, demo: root.demoMode}) }
+    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, dhcp: root.dhcpState, display: root.display, demo: root.demoMode}) }
   }
 }

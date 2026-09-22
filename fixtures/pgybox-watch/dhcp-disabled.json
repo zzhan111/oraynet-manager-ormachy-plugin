@@ -1,0 +1,1 @@
+{"code":0,"dhcp":[{"ip_start":1,"rent_time":"12h","switch":0,"ip_end":4,"interface":"lan"}],"rent_users":[{"mac":"00:00:00:00:00:01","name":"old","time":"x","alias":"old","ip":"192.0.2.2"}]}
