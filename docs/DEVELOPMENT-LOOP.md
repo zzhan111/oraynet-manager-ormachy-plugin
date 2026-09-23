@@ -135,7 +135,7 @@ git diff
 50% = 3 / 6
 ```
 
-本轮已完成 M1–M5 的实现与验收，因此进度为 `5 / 6 = 83.3%`。
+本轮已完成 M1–M6 的实现与验收，因此进度为 `6 / 6 = 100%`。
 
 M1 证据：
 
@@ -154,17 +154,20 @@ M4 contract notes: DHCP data is observed from `/en/networkSettings/DHCPSettings`
 
 M5 contract notes: component health is observed only from `/en/systemSettings/componentUpgrade` using the three exact API responses; firmware uses only stable `https://clientapi.sdwan.oray.com/softwares/PGY_ORAYBOX` responses. No upgrade endpoint, URL, MD5, log, or write action is used.
 
+M6 contract notes: diagnostics invoke only local `/usr/bin/ping` and `/usr/bin/tracepath` through argv, never a shell or router API. The target is validated locally, output is reduced to fixed safe fields/statuses, and no target is persisted.
+
 Collector evidence: WAN success cuts off immediately; device summaries require both device-list and IP-flow bodies; traffic emits field-preserving patches within a short settle window. Body and parser failures carry their section name, and offline replay covers route matching, dependency order, prompt cutoff, patch merging, isolated failures, empty data, invalid numeric values, and `enabled` normalization.
 
-## 83.3% 实现记录
+## 100% 实现记录
 
-2026-09-22 完成 M1–M5 实现与验收，进度为 `5 / 6 = 83.3%`。
+2026-09-22 完成 M1–M6 实现与验收，进度为 `6 / 6 = 100%`。
 
 离线证据：
 
 - `python3 bin/pgybox-watch --selfcheck`：通过。
+- `python3 bin/pgybox-diagnose --selfcheck`：通过。
 - `python3 bin/pgybox-open --selfcheck`：通过。
-- `python3 -m py_compile bin/pgybox-watch bin/pgybox-open`：通过。
+- `python3 -m py_compile bin/pgybox-watch bin/pgybox-open bin/pgybox-diagnose`：通过。
 - `omarchy plugin validate .`：通过。
 - `git diff --check`：通过。
 
@@ -193,11 +196,15 @@ M5 版本健康真实生命周期证据：
 - Omarchy shell 字段级合并组件与固件 patch，版本区块为 `ok`，无新的 PgyBox QML 错误。
 - watcher 未输出下载 URL、MD5、升级日志或认证信息，也未调用升级接口。
 
-## 剩余 16.7%
+M6 按需诊断真实生命周期证据：
 
-未完成里程碑：
+- 本机 `/usr/bin/ping` 与 `/usr/bin/tracepath` 仅通过 argv 运行；用户 systemd 与 Omarchy QML 回环 127.0.0.1 均成功。
+- 显式 IPC `diagnose ping 127.0.0.1` 产出 `ok`、latency 与 0% 丢包；`diagnose tracepath 127.0.0.1` 产出 1 跳到达。
+- 非法目标 `https://example.com` 产出 `invalid-target`，不会调用 ping/tracepath。
+- 打开/关闭面板无新的 PgyBox QML 错误；目标不写入磁盘。
+- 代理码沙盒中直接 ping 可能因缺少 socket 能力失败；真实用户会话不受影响。
 
-1. M6 按需诊断：仅在用户明确触发后运行 ping/traceroute。
+## 剩余风险
 
 已知风险与限制：
 
@@ -209,4 +216,4 @@ M5 版本健康真实生命周期证据：
 - 已验证当前实际 bar 布局；另一方向 bar 的视觉布局尚未做真实截图验收。
 - 登录、设备名与流量值仅在本机内存/IPC 中使用；fixture 和仓库未保存真实标识或认证信息。
 
-当前无阻塞 M1–M5 使用的问题；M6 属于剩余范围，其他项目属于后续兼容性风险。
+当前无阻塞 M1–M6 使用的问题；其余项目属于后续兼容性风险。

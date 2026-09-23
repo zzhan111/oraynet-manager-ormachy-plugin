@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Run explicit, local-only ping or tracepath diagnostics."""
+import ipaddress
+import json
+import math
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+
+PING = "/usr/bin/ping"
+TRACEPATH = "/usr/bin/tracepath"
+TIMEOUT = 8
+MAX_OUTPUT = 65536
+STATUSES = {"ok", "unreachable", "timeout", "invalid-target", "command-error", "unsupported", "parse-error", "output-limit"}
+LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def valid_target(value: str) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 253 or any(ord(c) < 32 or ord(c) > 127 or c.isspace() for c in value):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    if value.endswith(".") or "://" in value or ":" in value:
+        return False
+    labels = value.split(".")
+    return all(LABEL.fullmatch(label) for label in labels)
+
+
+def parse_ping(output: str, target: str, returncode: int) -> dict:
+    loss = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", output)
+    avg = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+/[\d.]+\s*ms", output)
+    if not loss:
+        return {"mode": "ping", "target": target, "ok": False, "reachable": False, "lossPct": None, "latencyMs": None, "status": "command-error" if returncode != 0 else "parse-error"}
+    loss_pct = float(loss.group(1))
+    latency = float(avg.group(1)) if avg else None
+    if not math.isfinite(loss_pct) or not 0 <= loss_pct <= 100 or latency is not None and (not math.isfinite(latency) or latency < 0):
+        return {"mode": "ping", "target": target, "ok": False, "reachable": False, "lossPct": None, "latencyMs": None, "status": "parse-error"}
+    reachable = returncode == 0 and loss_pct < 100
+    status = "ok" if reachable and latency is not None else "unreachable" if loss_pct >= 100 or returncode != 0 else "parse-error"
+    return {"mode": "ping", "target": target, "ok": status == "ok", "reachable": reachable, "lossPct": loss_pct, "latencyMs": latency, "status": status}
+
+
+def parse_tracepath(output: str, target: str, returncode: int) -> dict:
+    hops = len(re.findall(r"^\s*\d+:", output, flags=re.MULTILINE))
+    reached = returncode == 0 and bool(re.search(r"\breached\b|\bResume: pmtu", output, flags=re.IGNORECASE))
+    status = "ok" if reached else "command-error" if returncode != 0 else "parse-error"
+    return {"mode": "tracepath", "target": target, "ok": reached, "reached": reached, "hops": min(hops, 12), "status": status}
+
+
+def execute(argv: list[str]) -> tuple[int | None, str, str | None]:
+    process = subprocess.Popen(argv, shell=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    output = bytearray()
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill(); process.wait()
+                return None, "", "timeout"
+            ready, _, _ = select.select([process.stdout], [], [], min(remaining, 0.2))
+            if ready:
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > MAX_OUTPUT:
+                    process.kill(); process.wait()
+                    return None, "", "output-limit"
+            elif process.poll() is not None:
+                break
+        return process.wait(), output.decode("utf-8", "replace"), None
+    finally:
+        if process.poll() is None:
+            process.kill(); process.wait()
+
+
+def run(mode: str, target: str) -> dict:
+    if mode not in ("ping", "tracepath") or not valid_target(target):
+        return {"mode": mode if mode in ("ping", "tracepath") else "ping", "target": target if isinstance(target, str) else "", "ok": False, "status": "invalid-target"}
+    executable = PING if mode == "ping" else TRACEPATH
+    if not shutil.which(executable):
+        return {"mode": mode, "target": target, "ok": False, "status": "unsupported"}
+    argv = [executable, "-n", "-c", "3", "-W", "2", "--", target] if mode == "ping" else [executable, "-n", "-m", "12", target]
+    try:
+        returncode, output, error = execute(argv)
+    except OSError:
+        return {"mode": mode, "target": target, "ok": False, "status": "command-error"}
+    if error:
+        return {"mode": mode, "target": target, "ok": False, "status": error}
+    return parse_ping(output, target, returncode) if mode == "ping" else parse_tracepath(output, target, returncode)
+
+
+def selfcheck() -> None:
+    assert valid_target("127.0.0.1") and valid_target("2001:db8::1") and valid_target("example.com")
+    for value in ("", "a b", "https://example.com", "example.com:443", "-bad.example", "bad_.example", "--", "x\n"):
+        assert not valid_target(value), value
+    ping = parse_ping("3 packets transmitted, 3 packets received, 0% packet loss\nround-trip min/avg/max/stddev = 0.020/0.030/0.040/0.001 ms", "127.0.0.1", 0)
+    assert ping["ok"] and ping["lossPct"] == 0 and ping["latencyMs"] == 0.03
+    assert parse_ping("9" * 400 + "% packet loss", "example.com", 0)["status"] == "parse-error"
+    trace = parse_tracepath(" 1:  127.0.0.1  0.123ms\nResume: pmtu 65535", "127.0.0.1", 0)
+    assert trace["reached"] and trace["hops"] == 1
+    assert set(ping) == {"mode", "target", "ok", "reachable", "lossPct", "latencyMs", "status"}
+    assert execute([sys.executable, "-c", f"print('x' * {MAX_OUTPUT})"])[2] == "output-limit"
+    if shutil.which(PING):
+        result = run("ping", "127.0.0.1")
+        assert result["mode"] == "ping" and result["target"] == "127.0.0.1" and result["status"] in STATUSES
+    if shutil.which(TRACEPATH):
+        result = run("tracepath", "127.0.0.1")
+        assert result["mode"] == "tracepath" and result["target"] == "127.0.0.1" and result["status"] in STATUSES
+    print("pgybox-diagnose selfcheck: OK")
+
+
+def main() -> int:
+    if "--selfcheck" in sys.argv:
+        selfcheck(); return 0
+    if len(sys.argv) != 3:
+        print(json.dumps({"mode": "ping", "target": "", "ok": False, "status": "invalid-target"}, separators=(",", ":")))
+        return 2
+    result = run(sys.argv[1], sys.argv[2])
+    print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

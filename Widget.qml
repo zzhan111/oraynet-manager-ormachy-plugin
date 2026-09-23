@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
@@ -25,6 +26,10 @@ Panel {
   property var trafficState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property var dhcpState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
   property var updatesState: ({ data: null, lastSuccessTs: 0, status: "no-data", error: "", reachable: false })
+  property var diagnosticState: ({ mode: "", target: "", status: "idle", ok: false, reachable: false, lossPct: null, latencyMs: null, hops: null })
+  property bool diagnosticExpanded: false
+  property bool diagnosticBusy: false
+  property string diagnosticMode: ""
   property bool ratesCollapsed: false
   property double nowSec: Date.now() / 1000
   property bool demoMode: false
@@ -107,6 +112,31 @@ Panel {
     var opener = Qt.resolvedUrl("bin/pgybox-open").toString().replace(/^file:\/\//, "")
     Quickshell.execDetached([opener])
     root.close()
+  }
+  function startDiagnostic(mode) {
+    if (diagnosticBusy || !diagnosticField.text.trim()) return
+    diagnosticMode = mode
+    diagnosticBusy = true
+    diagnosticProc.running = true
+  }
+  function parseDiagnostic(text) {
+    try {
+      var value = JSON.parse(String(text || ""))
+      var allowed = ["ok", "unreachable", "timeout", "invalid-target", "command-error", "unsupported", "parse-error", "output-limit"]
+      var status = allowed.indexOf(String(value.status || "")) >= 0 ? String(value.status) : "command-error"
+      var loss = value.lossPct === null || value.lossPct === undefined ? null : Number(value.lossPct)
+      var latency = value.latencyMs === null || value.latencyMs === undefined ? null : Number(value.latencyMs)
+      var hops = value.hops === null || value.hops === undefined ? null : Number(value.hops)
+      if (!isFinite(loss) || loss < 0 || loss > 100) loss = null
+      if (!isFinite(latency) || latency < 0) latency = null
+      if (!isFinite(hops) || hops < 0 || hops > 12) hops = null
+      var mode = value.mode === "tracepath" ? "tracepath" : "ping"
+      var ok = value.ok === true && status === "ok" && (mode === "ping" ? loss !== null && latency !== null : hops !== null)
+      if (status === "ok" && !ok) status = "parse-error"
+      root.diagnosticState = ({mode: mode, target: String(value.target || ""), status: status, ok: ok, reachable: value.reachable === true || value.reached === true, lossPct: loss, latencyMs: latency, hops: hops})
+    } catch (e) {
+      root.diagnosticState = ({mode: root.diagnosticMode, target: diagnosticField.text, status: "command-error", ok: false, reachable: false, lossPct: null, latencyMs: null, hops: null})
+    }
   }
   function markPageReachable() {
     if (!root.wanState.reachable) root.wanState = ({
@@ -197,6 +227,15 @@ Panel {
       }
     }
     onExited: restartTimer.start()
+  }
+  readonly property string diagnose: Qt.resolvedUrl("bin/pgybox-diagnose").toString().replace(/^file:\/\//, "")
+  Process {
+    id: diagnosticProc
+    command: [root.diagnose, root.diagnosticMode, diagnosticField.text]
+    running: false
+    stdout: SplitParser { onRead: function(data) { root.parseDiagnostic(data) } }
+    stderr: SplitParser { onRead: function(data) { } }
+    onExited: root.diagnosticBusy = false
   }
   Timer {
     id: restartTimer
@@ -305,6 +344,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: diagnosticField.activeFocus
       onActivateRequested: root.openCloud()
       onCloseRequested: root.close()
       onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
@@ -432,6 +472,41 @@ Panel {
           Text { visible: !root.updatesState.data; text: root.updatesState.status === "no-data" ? "暂无版本数据" : "版本数据暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
           Text { visible: !!root.updatesState.data && !root.updatesFresh; text: "版本数据已过期或暂不可用"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall }
         }
+        Rectangle { width: parent.width; height: 1; color: root.faint }
+        Column {
+          width: parent.width
+          spacing: Style.space(3)
+          Button {
+            id: diagnosticToggle
+            text: root.diagnosticExpanded ? "诊断（收起）" : "按需诊断"
+            onClicked: root.diagnosticExpanded = !root.diagnosticExpanded
+          }
+          TextField {
+            id: diagnosticField
+            visible: root.diagnosticExpanded
+            width: parent.width
+            placeholderText: "目标 IPv4、IPv6 或域名"
+            selectByMouse: true
+            enabled: !root.diagnosticBusy
+            onAccepted: root.startDiagnostic("ping")
+          }
+          Row {
+            visible: root.diagnosticExpanded
+            spacing: Style.space(3)
+            Button { text: root.diagnosticBusy ? "运行中…" : "Ping"; enabled: !root.diagnosticBusy; onClicked: root.startDiagnostic("ping") }
+            Button { text: root.diagnosticBusy ? "运行中…" : "Route"; enabled: !root.diagnosticBusy; onClicked: root.startDiagnostic("tracepath") }
+          }
+          Text {
+            visible: root.diagnosticExpanded && root.diagnosticState.status !== "idle"
+            text: root.diagnosticState.status === "ok"
+              ? (root.diagnosticState.mode === "ping" ? "可达 · " + (root.diagnosticState.latencyMs === null ? "—" : root.diagnosticState.latencyMs) + " ms · 丢包 " + (root.diagnosticState.lossPct === null ? "—" : root.diagnosticState.lossPct) + "%" : "到达 · " + (root.diagnosticState.hops === null ? "—" : root.diagnosticState.hops) + " 跳")
+              : "诊断：" + root.diagnosticState.status
+            color: root.diagnosticState.ok ? root.fg : root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
+          }
+        }
       }
     }
   }
@@ -468,7 +543,14 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
+    function diagnose(mode: string, target: string): string {
+      if (root.diagnosticBusy || ["ping", "tracepath"].indexOf(mode) < 0) return "rejected"
+      root.diagnosticExpanded = true
+      diagnosticField.text = target
+      root.startDiagnostic(mode)
+      return root.diagnosticBusy ? "started" : "rejected"
+    }
     function demo(): string { root.demoMode = !root.demoMode; if (root.demoMode && !root.opened) root.open(); return root.demoMode ? "demo" : "live" }
-    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, dhcp: root.dhcpState, updates: root.updatesState, display: root.display, demo: root.demoMode}) }
+    function state(): string { return JSON.stringify({wan: root.wanState, devices: root.devicesState, traffic: root.trafficState, dhcp: root.dhcpState, updates: root.updatesState, diagnostic: root.diagnosticState, display: root.display, demo: root.demoMode}) }
   }
 }
